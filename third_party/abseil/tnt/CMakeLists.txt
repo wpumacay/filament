@@ -1,8 +1,7 @@
 option(FILAMENT_USE_EXTERNAL_ABSL "Use find_package to locate an external Abseil dependency" OFF)
 
 if (DEFINED absl_SOURCE_DIR AND DEFINED absl_BINARY_DIR)
-  add_subdirectory(${absl_SOURCE_DIR})
-  add_subdirectory(${absl_BINARY_DIR})
+  message(STATUS "abseil was already setup by another project")
 else()
   if (FILAMENT_USE_EXTERNAL_ABSL)
     find_package(absl CONFIG QUIET)
