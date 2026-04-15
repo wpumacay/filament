@@ -47,12 +47,14 @@
 #include "details/Skybox.h"
 #include "details/Sync.h"
 
-#include "private/backend/CommandBufferQueue.h"
-#include "private/backend/CommandStream.h"
-#include "private/backend/DriverApi.h"
 
 #include <private/filament/EngineEnums.h>
-#include <private/filament/BufferInterfaceBlock.h>
+
+#include <private/backend/CommandBufferQueue.h>
+#include <private/backend/CommandStream.h>
+#include <private/backend/DriverApi.h>
+
+#include <private/utils/FeatureFlagManager.h>
 
 #include <filament/ColorGrading.h>
 #include <filament/Engine.h>
@@ -70,10 +72,11 @@
 #include <utils/compiler.h>
 #include <utils/CountDownLatch.h>
 #include <utils/FixedCapacityVector.h>
+#include <utils/Invocable.h>
 #include <utils/JobSystem.h>
 #include <utils/Slice.h>
+#include <utils/tribool.h>
 
-#include <array>
 #include <chrono>
 #include <memory>
 #include <new>
@@ -83,6 +86,9 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+
+#include <stddef.h>
+#include <stdint.h>
 
 #if FILAMENT_ENABLE_MATDBG
 #include <matdbg/DebugServer.h>
@@ -99,14 +105,6 @@ using MaterialKey = uint32_t;
 namespace filament::fgviewer {
     class DebugServer;
 } // namespace filament::fgviewer
-#endif
-
-// We have added correctness assertions that breaks clients' projects. We add this define to allow
-// for the client's to address these assertions at a more gradual pace.
-#if defined(FILAMENT_RELAXED_CORRECTNESS_ASSERTIONS)
-#define CORRECTNESS_ASSERTION_DEFAULT false
-#else
-#define CORRECTNESS_ASSERTION_DEFAULT true
 #endif
 
 namespace filament {
@@ -134,7 +132,7 @@ class TextureCache;
  * Concrete implementation of the Engine interface. This keeps track of all hardware resources
  * for a given context.
  */
-class FEngine : public Engine {
+class FEngine : public Engine, public utils::FeatureFlagManager {
 public:
     void* operator new(std::size_t const size) noexcept {
         return utils::aligned_alloc(size, alignof(FEngine));
@@ -216,7 +214,7 @@ public:
         return getDriver().isStereoSupported();
     }
 
-    bool isAsynchronousOperationSupported() const noexcept;
+    bool isAsynchronousModeEnabled() const noexcept;
 
     static size_t getMaxStereoscopicEyes() noexcept {
         return CONFIG_MAX_STEREOSCOPIC_EYES;
@@ -425,7 +423,7 @@ public:
     size_t getRenderTargetCount() const noexcept;
 
     AsyncCallId runCommandAsync(utils::Invocable<void()>&& command,
-            backend::CallbackHandler* handler, utils::Invocable<void()>&& onComplete);
+            backend::CallbackHandler* handler, AsyncCompletionCallback onComplete, void* user);
     bool cancelAsyncCall(AsyncCallId id);
 
     void destroy(utils::Entity e);
@@ -458,7 +456,7 @@ public:
         return mPlatform->pumpEvents();
     }
 
-    void prepare();
+    void prepare(backend::DriverApi& driver);
     void gc();
     void submitFrame();
 
@@ -572,6 +570,25 @@ public:
 
     backend::Driver& getDriver() const noexcept { return *mDriver; }
 
+    utils::Slice<const Engine::FeatureFlag> getFeatureFlags() const noexcept;
+    bool setFeatureFlag(char const* name, bool value) noexcept;
+    std::optional<bool> getFeatureFlag(char const* name) const noexcept;
+    bool* getFeatureFlagPtr(std::string_view name, bool allowConstant = false) const noexcept;
+
+    void compile(
+        backend::CompilerPriorityQueue priority,
+        FMaterial const* material,
+        FView const* view,
+        utils::tribool shadowReceiver,
+        utils::tribool skinning,
+        backend::CallbackHandler* handler = nullptr,
+        utils::Invocable<void(Material*)>&& callback = {});
+
+    static utils::FixedCapacityVector<Variant> getMaterialCompileVariants(
+        FView const* view,
+        utils::tribool shadowReceiver,
+        utils::tribool skinning) noexcept;
+
 private:
     explicit FEngine(Builder const& builder);
     void init();
@@ -580,11 +597,13 @@ private:
     int loop();
     void flushCommandBuffer(backend::CommandBufferQueue& commandBufferQueue) const;
 
+    void gcDeferredAsyncObjectDestruction();
+
     template<typename T>
     bool isValid(const T* ptr, ResourceList<T> const& list) const;
 
     template<typename T>
-    bool terminateAndDestroy(const T* p, ResourceList<T>& list);
+    bool terminateAndDestroy(const T* ptr, ResourceList<T>& list);
 
     template<typename T, typename Lock>
     bool terminateAndDestroyLocked(Lock& lock, const T* p, ResourceList<T>& list);
@@ -706,6 +725,8 @@ private:
     // Creation parameters
     Config mConfig;
 
+    std::vector<std::function<bool()>> mDeferredAsyncObjectDestruction;
+
 public:
     // These are the debug properties used by FDebug.
     // They're accessed directly by modules who need them.
@@ -752,118 +773,6 @@ public:
         matdbg::DebugServer* server = nullptr;
         fgviewer::DebugServer* fgviewerServer = nullptr;
     } debug;
-
-    struct {
-        struct {
-            struct {
-                bool use_1d_lut = false;
-            } color_grading;
-            struct {
-                bool use_shadow_atlas = false;
-            } shadows;
-            struct {
-                // TODO: clean-up the following flags (equivalent to setting them to true) when
-                // clients have addressed their usages.
-                bool assert_material_instance_in_use = CORRECTNESS_ASSERTION_DEFAULT;
-                bool assert_destroy_material_before_material_instance =
-                        CORRECTNESS_ASSERTION_DEFAULT;
-                bool assert_vertex_buffer_count_exceeds_8 = CORRECTNESS_ASSERTION_DEFAULT;
-                bool assert_vertex_buffer_attribute_stride_mult_of_4 =
-                        CORRECTNESS_ASSERTION_DEFAULT;
-                bool assert_material_instance_texture_descriptor_set_compatible =
-                        CORRECTNESS_ASSERTION_DEFAULT;
-                bool assert_texture_can_generate_mipmap = CORRECTNESS_ASSERTION_DEFAULT;
-            } debug;
-            struct {
-                bool disable_gpu_frame_complete_metric = true;
-            } frame_info;
-        } engine;
-        struct {
-            struct {
-                bool assert_native_window_is_valid = false;
-            } opengl;
-            struct {
-                // On Unified Memory Architecture device, it is possible to bypass using the staging
-                // buffer. This is an experimental feature that still needs to be implemented fully
-                // before it can be fully enabled.
-                bool enable_staging_buffer_bypass = false;
-            } vulkan;
-            bool disable_parallel_shader_compile = false;
-            bool disable_amortized_shader_compile = true;
-            bool disable_handle_use_after_free_check = false;
-            bool disable_heap_handle_tags = true; // FIXME: this should be false
-            bool enable_asynchronous_operation = false;
-        } backend;
-        struct {
-            bool check_crc32_after_loading = false;
-            bool enable_material_instance_uniform_batching = false;
-        } material;
-    } features;
-
-    std::array<FeatureFlag, sizeof(features)> const mFeatures{{
-            { "backend.disable_parallel_shader_compile",
-              "Disable parallel shader compilation in GL and Metal backends.",
-              &features.backend.disable_parallel_shader_compile },
-            { "backend.disable_amortized_shader_compile",
-              "Disable amortized shader compilation in GL backend.",
-              &features.backend.disable_amortized_shader_compile },
-            { "backend.disable_handle_use_after_free_check",
-              "Disable Handle<> use-after-free checks.",
-              &features.backend.disable_handle_use_after_free_check },
-            { "backend.disable_heap_handle_tags",
-              "Disable Handle<> tags for heap-allocated handles.",
-              &features.backend.disable_heap_handle_tags },
-            { "backend.enable_asynchronous_operation",
-              "Enable asynchronous operation for resource management.",
-              &features.backend.enable_asynchronous_operation },
-            { "backend.opengl.assert_native_window_is_valid",
-              "Asserts that the ANativeWindow is valid when rendering starts.",
-              &features.backend.opengl.assert_native_window_is_valid },
-            { "engine.color_grading.use_1d_lut",
-              "Uses a 1D LUT for color grading.",
-              &features.engine.color_grading.use_1d_lut, false },
-            { "engine.shadows.use_shadow_atlas",
-              "Uses an array of atlases to store shadow maps.",
-              &features.engine.shadows.use_shadow_atlas, false },
-            { "engine.debug.assert_material_instance_in_use",
-              "Assert when a MaterialInstance is destroyed while it is in use by RenderableManager.",
-              &features.engine.debug.assert_material_instance_in_use, false },
-            { "engine.debug.assert_destroy_material_before_material_instance",
-              "Assert when a Material is destroyed but its instances are still alive.",
-              &features.engine.debug.assert_destroy_material_before_material_instance, false },
-            { "engine.debug.assert_vertex_buffer_count_exceeds_8",
-              "Assert when a client's number of buffers for a VertexBuffer exceeds 8.",
-              &features.engine.debug.assert_vertex_buffer_count_exceeds_8, false },
-            { "engine.debug.assert_vertex_buffer_attribute_stride_mult_of_4",
-              "Assert that the attribute stride of a vertex buffer is a multiple of 4.",
-              &features.engine.debug.assert_vertex_buffer_attribute_stride_mult_of_4, false },
-            { "backend.vulkan.enable_staging_buffer_bypass",
-              "vulkan: enable a staging bypass logic for unified memory architecture.",
-              &features.backend.vulkan.enable_staging_buffer_bypass, false },
-            { "engine.debug.assert_material_instance_texture_descriptor_set_compatible",
-              "Assert that the textures in a material instance are compatible with descriptor set.",
-              &features.engine.debug.assert_material_instance_texture_descriptor_set_compatible, false },
-            { "engine.debug.assert_texture_can_generate_mipmap",
-              "Assert if a texture has the correct usage set for generating mipmaps.",
-              &features.engine.debug.assert_texture_can_generate_mipmap, false },
-            { "material.check_crc32_after_loading",
-              "Verify the checksum of package data when a material is loaded.",
-              &features.material.check_crc32_after_loading, false },
-            { "material.enable_material_instance_uniform_batching",
-              "Make all MaterialInstances share a common large uniform buffer and use sub-allocations within it.",
-              &features.material.enable_material_instance_uniform_batching },
-            { "engine.frame_info.disable_gpu_complete_metric",
-              "Disable Renderer::FrameInfo::gpuFrameComplete reporting",
-              &features.engine.frame_info.disable_gpu_frame_complete_metric },
-    }};
-
-    utils::Slice<const FeatureFlag> getFeatureFlags() const noexcept {
-        return { mFeatures.data(), mFeatures.size() };
-    }
-
-    bool setFeatureFlag(char const* name, bool value) const noexcept;
-    std::optional<bool> getFeatureFlag(char const* name) const noexcept;
-    bool* getFeatureFlagPtr(std::string_view name, bool allowConstant = false) const noexcept;
 };
 
 FILAMENT_DOWNCAST(Engine)

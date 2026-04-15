@@ -69,6 +69,7 @@ public:
     MOCK_METHOD(bool, isTextureFormatSupported, (backend::TextureFormat format), (override));
     MOCK_METHOD(bool, isTextureSwizzleSupported, (), (override));
     MOCK_METHOD(bool, isTextureFormatMipmappable, (backend::TextureFormat format), (override));
+    MOCK_METHOD(bool, isTextureFormatFilterable, (backend::TextureFormat format), (override));
     MOCK_METHOD(bool, isRenderTargetFormatSupported, (backend::TextureFormat format), (override));
     MOCK_METHOD(bool, isFrameBufferFetchSupported, (), (override));
     MOCK_METHOD(bool, isFrameBufferFetchMultiSampleSupported, (), (override));
@@ -83,6 +84,7 @@ public:
     MOCK_METHOD(bool, isDepthStencilBlitSupported, (backend::TextureFormat format), (override));
     MOCK_METHOD(bool, isProtectedTexturesSupported, (), (override));
     MOCK_METHOD(bool, isDepthClampSupported, (), (override));
+    MOCK_METHOD(bool, isAsynchronousModeEnabled, (), (override));
     MOCK_METHOD(uint8_t, getMaxDrawBuffers, (), (override));
     MOCK_METHOD(size_t, getMaxUniformBufferSize, (), (override));
     MOCK_METHOD(size_t, getMaxTextureSize, (backend::SamplerType target), (override));

@@ -163,8 +163,8 @@ public:
             const Viewport& physicalViewport,
             const Viewport& logicalViewport) const noexcept;
 
-    void prepareShadowing(FEngine& engine, FScene::RenderableSoa& renderableData,
-            FScene::LightSoa const& lightData, CameraInfo const& cameraInfo) noexcept;
+    void prepareShadowing(FEngine& engine, backend::DriverApi& driver,
+            FScene::RenderableSoa& renderableData, FScene::LightSoa const& lightData, CameraInfo const& cameraInfo) noexcept;
     void prepareLighting(FEngine& engine, CameraInfo const& cameraInfo) noexcept;
 
     void prepareSSAO(backend::Handle<backend::HwTexture> ssao) const noexcept;
@@ -262,9 +262,12 @@ public:
     }
 
     void setSampleCount(uint8_t count) noexcept {
-        count = uint8_t(count < 1u ? 1u : count);
-        mMultiSampleAntiAliasingOptions.sampleCount = count;
-        mMultiSampleAntiAliasingOptions.enabled = count > 1u;
+        // MSAA is a post-process effect, and post-processing is disabled at FL0
+        if (mFeatureLevel >= backend::FeatureLevel::FEATURE_LEVEL_1) {
+            count = uint8_t(count < 1u ? 1u : count);
+            mMultiSampleAntiAliasingOptions.sampleCount = count;
+            mMultiSampleAntiAliasingOptions.enabled = count > 1u;
+        }
     }
 
     uint8_t getSampleCount() const noexcept {
@@ -457,8 +460,12 @@ public:
     static void cullRenderables(utils::JobSystem& js, FScene::RenderableSoa& renderableData,
             Frustum const& frustum, size_t bit) noexcept;
 
+    ColorPassDescriptorSet& getColorPassDescriptorSet(ShadowType type) const noexcept {
+        return mColorPassDescriptorSet[type == ShadowType::PCF ? 0 : 1];
+    }
+
     ColorPassDescriptorSet& getColorPassDescriptorSet() const noexcept {
-            return mColorPassDescriptorSet[mShadowType == ShadowType::PCF ? 0 : 1];
+        return getColorPassDescriptorSet(mShadowType);
     }
 
     // Returns the frame history FIFO. This is typically used by the FrameGraph to access
@@ -501,6 +508,8 @@ public:
     }
 
     MaterialGlobals getMaterialGlobals() const { return mMaterialGlobals; }
+
+    ShadowMapManager const& getShadowMapManager() const noexcept { return *mShadowMapManager; }
 
 private:
     struct FPickingQuery : public PickingQuery {
@@ -577,6 +586,7 @@ private:
     bool mCulling = true;
     bool mFrontFaceWindingInverted = false;
     bool mIsTransparentPickingEnabled = false;
+    bool mIsHighPrecisionEvsmSupported = true;
 
     FRenderTarget* mRenderTarget = nullptr;
 
@@ -622,6 +632,8 @@ private:
     FPickingQuery* mActivePickingQueriesList = nullptr;
 
     utils::CString mName;
+
+    backend::FeatureLevel mFeatureLevel = backend::FeatureLevel::FEATURE_LEVEL_1;
 
     // the following values are set by prepare()
     Range mVisibleRenderables;

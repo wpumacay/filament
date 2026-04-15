@@ -56,7 +56,9 @@ set(SRCS
         src/materials/bloom/bloom.cpp
         src/materials/colorGrading/colorGrading.cpp
         src/materials/dof/dof.cpp
+        src/materials/evsm/evsm.cpp
         src/materials/flare/flare.cpp
+        src/materials/fog/fog.cpp
         src/materials/fsr/fsr.cpp
         src/materials/sgsr/sgsr.cpp
         src/materials/ssao/ssao.cpp
@@ -91,6 +93,8 @@ set(SRCS
         src/MaterialParser.cpp
         src/MorphTargetBuffer.cpp
         src/PostProcessManager.cpp
+        src/ProgramSpecialization.cpp
+        src/LocalProgramCache.cpp
         src/RenderPass.cpp
         src/RenderPrimitive.cpp
         src/RenderTarget.cpp
@@ -184,9 +188,11 @@ set(PRIVATE_HDRS
         src/MaterialCache.h
         src/MaterialDefinition.h
         src/MaterialParser.h
+        src/LocalProgramCache.h
         src/MaterialInstanceManager.h
         src/PIDController.h
         src/PostProcessManager.h
+        src/ProgramSpecialization.h
         src/RenderPass.h
         src/RenderPrimitive.h
         src/RendererUtils.h
@@ -280,7 +286,10 @@ set(MATERIAL_SRCS
         src/materials/dof/dofMipmap.mat
         src/materials/dof/dofTiles.mat
         src/materials/dof/dofTilesSwizzle.mat
+        src/materials/evsm/gaussian.mat
+        src/materials/evsm/vsmMipmap.mat
         src/materials/flare/flare.mat
+        src/materials/fog/fog.mat
         src/materials/fsr/fsr_easu.mat
         src/materials/fsr/fsr_easu_mobile.mat
         src/materials/fsr/fsr_easu_mobileF.mat
@@ -295,7 +304,6 @@ set(MATERIAL_SRCS
         src/materials/ssao/mipmapDepth.mat
         src/materials/ssao/sao.mat
         src/materials/ssao/saoBentNormals.mat
-        src/materials/vsmMipmap.mat
 )
 
 if (NOT FILAMENT_DISABLE_GTAO)
@@ -305,12 +313,8 @@ if (NOT FILAMENT_DISABLE_GTAO)
     )
 endif()
 
-set(MATERIAL_FL0_SRCS
-        src/materials/defaultMaterial.mat
-        src/materials/skybox.mat
-)
-
 set(MATERIAL_MULTIVIEW_SRCS
+        src/materials/clearDepth.mat
         src/materials/defaultMaterial.mat
         src/materials/skybox.mat
 )
@@ -333,11 +337,6 @@ if (NOT DFG_LUT_SIZE)
     endif()
 endif()
 message(STATUS "DFG LUT size set to ${DFG_LUT_SIZE}x${DFG_LUT_SIZE}")
-
-# Whether to include FL0 materials.
-if (FILAMENT_ENABLE_FEATURE_LEVEL_0)
-    add_definitions(-DFILAMENT_ENABLE_FEATURE_LEVEL_0)
-endif()
 
 # Whether to include MULTIVIEW materials.
 if (FILAMENT_ENABLE_MULTIVIEW)
@@ -419,21 +418,6 @@ foreach(mat_dir ${MATERIAL_DIRS})
         )
         list(APPEND FILAMAT_FILES_FOR_GROUP ${output_path})
         list(APPEND FILAMAT_TARGETS_FOR_GROUP ${output_path})
-
-        # --- Feature Level 0 variant ---
-        list(FIND MATERIAL_FL0_SRCS ${mat_src} index)
-        if (${index} GREATER -1 AND FILAMENT_ENABLE_FEATURE_LEVEL_0)
-            string(REGEX REPLACE "[.]filamat$" "_fl0.filamat" output_path_fl0 ${output_path})
-            add_custom_command(
-                    OUTPUT ${output_path_fl0}
-                    COMMAND matc ${MATC_BASE_FLAGS} -PfeatureLevel=0 -o ${output_path_fl0} ${fullname}
-                    MAIN_DEPENDENCY ${fullname}
-                    DEPENDS matc
-                    COMMENT "Compiling material ${fullname} (FL0)"
-            )
-            list(APPEND FILAMAT_FILES_FOR_GROUP ${output_path_fl0})
-            list(APPEND FILAMAT_TARGETS_FOR_GROUP ${output_path_fl0})
-        endif()
 
         # --- Multiview variant ---
         list(FIND MATERIAL_MULTIVIEW_SRCS ${mat_src} index)
@@ -520,6 +504,14 @@ add_custom_command(
 add_custom_command(
         OUTPUT "${MATERIAL_DIR}/dofCombine.filamat"
         DEPENDS src/materials/dof/dofUtils.fs
+        APPEND
+)
+
+add_custom_command(
+        OUTPUT "${MATERIAL_DIR}/fog.filamat"
+        DEPENDS ../shaders/src/surface_fog.fs
+        DEPENDS src/materials/utils/depthUtils.fs
+        DEPENDS src/materials/utils/geometry.fs
         APPEND
 )
 
@@ -621,6 +613,12 @@ add_custom_command(
         OUTPUT "${MATERIAL_DIR}/separableGaussianBlur.filamat"
         DEPENDS src/materials/separableGaussianBlur.vs
         DEPENDS src/materials/separableGaussianBlur.fs
+        APPEND
+)
+
+add_custom_command(
+        OUTPUT "${MATERIAL_DIR}/gaussian.filamat"
+        DEPENDS src/materials/evsm/gaussian.fs
         APPEND
 )
 

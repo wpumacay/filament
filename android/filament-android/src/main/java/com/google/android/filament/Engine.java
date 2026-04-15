@@ -206,6 +206,15 @@ public class Engine {
     };
 
     /**
+     * Three-state feature state.
+     */
+    public enum FeatureState {
+        FALSE,
+        TRUE,
+        INDETERMINATE
+    }
+
+    /**
      * Constructs <code>Engine</code> objects using a builder pattern.
      */
     public static class Builder {
@@ -619,6 +628,35 @@ public class Engine {
     }
 
     /**
+     * Asynchronously ensures that the variants of the specified Material required to render it
+     * in the provided View are compiled. This determines the necessary permutations of 
+     * feature flags based on the supplied View, and compiles the corresponding shader variants.
+     *
+     * See {@link Material#compile(Material.CompilerPriorityQueue, int, Object, Runnable)} for 
+     * important details about the compilation process, callback scheduling, priorities, and flushing the engine.
+     *
+     * @param priority       Which priority queue to use, LOW or HIGH.
+     * @param material       The Material whose variants will be compiled.
+     * @param view           The View in which the material will be rendered.
+     * @param shadowReceiver Indicates whether to compile variants where the material receives shadows.
+     *                       Use FeatureState.INDETERMINATE to compile both permutations.
+     * @param skinning       Indicates whether to compile variants with skinning.
+     *                       Use FeatureState.INDETERMINATE to compile both permutations.
+     * @param handler        An {@link java.util.concurrent.Executor Executor}. On Android this can also be a {@link android.os.Handler Handler}.
+     * @param callback       callback called on the main thread when the compilation is done
+     *                       by backend.
+     */
+    public void compile(@NonNull Material.CompilerPriorityQueue priority,
+                        @NonNull Material material,
+                        @NonNull View view,
+                        @NonNull FeatureState shadowReceiver,
+                        @NonNull FeatureState skinning,
+                        @Nullable Object handler,
+                        @Nullable Runnable callback) {
+        nCompile(getNativeObject(), priority.ordinal(), material.getNativeObject(), view.getNativeObject(), shadowReceiver.ordinal(), skinning.ordinal(), handler, callback);
+    }
+
+    /**
      * Destroy the <code>Engine</code> instance and all associated resources.
      * <p>
      * This method is one of the few thread-safe methods.
@@ -944,6 +982,15 @@ public class Engine {
      * @param object Object to check for validity
      * @return returns true if the specified object is valid.
      */
+    public boolean isValidMorphTargetBuffer(@NonNull MorphTargetBuffer object) {
+        return nIsValidMorphTargetBuffer(getNativeObject(), object.getNativeObject());
+    }
+
+    /**
+     * Returns whether the object is valid.
+     * @param object Object to check for validity
+     * @return returns true if the specified object is valid.
+     */
     public boolean isValidIndirectLight(@NonNull IndirectLight object) {
         return nIsValidIndirectLight(getNativeObject(), object.getNativeObject());
     }
@@ -1190,6 +1237,15 @@ public class Engine {
     public void destroySkinningBuffer(@NonNull SkinningBuffer skinningBuffer) {
         assertDestroy(nDestroySkinningBuffer(getNativeObject(), skinningBuffer.getNativeObject()));
         skinningBuffer.clearNativeObject();
+    }
+
+    /**
+     * Destroys a {@link MorphTargetBuffer} and frees all its associated resources.
+     * @param morphTargetBuffer the {@link MorphTargetBuffer} to destroy
+     */
+    public void destroyMorphTargetBuffer(@NonNull MorphTargetBuffer morphTargetBuffer) {
+        assertDestroy(nDestroyMorphTargetBuffer(getNativeObject(), morphTargetBuffer.getNativeObject()));
+        morphTargetBuffer.clearNativeObject();
     }
 
     /**
@@ -1483,6 +1539,7 @@ public class Engine {
     private static native boolean nDestroyIndexBuffer(long nativeEngine, long nativeIndexBuffer);
     private static native boolean nDestroyVertexBuffer(long nativeEngine, long nativeVertexBuffer);
     private static native boolean nDestroySkinningBuffer(long nativeEngine, long nativeSkinningBuffer);
+    private static native boolean nDestroyMorphTargetBuffer(long nativeEngine, long nativeMorphTargetBuffer);
     private static native boolean nDestroyIndirectLight(long nativeEngine, long nativeIndirectLight);
     private static native boolean nDestroyMaterial(long nativeEngine, long nativeMaterial);
     private static native boolean nDestroyMaterialInstance(long nativeEngine, long nativeMaterialInstance);
@@ -1499,6 +1556,7 @@ public class Engine {
     private static native boolean nIsValidIndexBuffer(long nativeEngine, long nativeIndexBuffer);
     private static native boolean nIsValidVertexBuffer(long nativeEngine, long nativeVertexBuffer);
     private static native boolean nIsValidSkinningBuffer(long nativeEngine, long nativeSkinningBuffer);
+    private static native boolean nIsValidMorphTargetBuffer(long nativeEngine, long nativeMorphTargetBuffer);
     private static native boolean nIsValidIndirectLight(long nativeEngine, long nativeIndirectLight);
     private static native boolean nIsValidMaterial(long nativeEngine, long nativeMaterial);
     private static native boolean nIsValidMaterialInstance(long nativeEngine, long nativeMaterial, long nativeMaterialInstance);
@@ -1511,6 +1569,7 @@ public class Engine {
     private static native void nDestroyEntity(long nativeEngine, int entity);
     private static native boolean nFlushAndWait(long nativeEngine, long timeout);
     private static native void nFlush(long nativeEngine);
+    private static native void nCompile(long nativeEngine, int priority, long nativeMaterial, long nativeView, int shadowReceiver, int skinning, Object handler, Runnable callback);
     private static native boolean nIsPaused(long nativeEngine);
     private static native void nSetPaused(long nativeEngine, boolean paused);
     private static native void nUnprotected(long nativeEngine);

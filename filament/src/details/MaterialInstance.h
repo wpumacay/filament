@@ -45,6 +45,7 @@
 #include <limits>
 #include <mutex>
 #include <string_view>
+#include <variant>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -90,6 +91,10 @@ public:
         mScissorRect = { int32_t(left), int32_t(bottom),
                 std::min(width, maxvalu), std::min(height, maxvalu) };
         mHasScissor = true;
+    }
+
+    void setScissor(backend::Viewport const& viewport) noexcept {
+        setScissor(viewport.left, viewport.bottom, viewport.width, viewport.height);
     }
 
     void unsetScissor() noexcept {

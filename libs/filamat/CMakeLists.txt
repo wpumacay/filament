@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.19)
+
+include(${EXTERNAL}/clang/usage_ios_13.cmake)
+
 project(filamat)
 
 set(TARGET         filamat)
@@ -154,7 +157,7 @@ endif()
 # ==================================================================================================
 # Tests
 # ==================================================================================================
-if (IS_HOST_PLATFORM)
+if (FILAMENT_BUILD_TESTING AND IS_HOST_PLATFORM)
     project(test_filamat)
     set(TARGET test_filamat)
     set(SRCS

@@ -1,6 +1,7 @@
 # Rendering Difference Test
 
-This tool is a collections of scripts to run `gltf_viewer` and produce headless renderings.
+This tool (`/test/renderdiff`) is a collections of scripts to run `gltf_viewer` and produce headless
+renderings.
 
 This is mainly useful for continuous integration where GPUs are generally not available on cloud
 machines. To perform software rasterization, these scripts are centered around [Mesa]'s
@@ -75,10 +76,11 @@ into **branch** of `filament-assets`. This branch is paired with a PR or commit 
 
 As an example, imagine I am working on a PR, and I've uploaded my change, which is in a
 branch called `my-pr-branch`, to `filament`. This PR requires updating the golden. We would do
-it in the following fashion
+it in the following fashion on a macOS machine:
 
 ### Using a script to update the golden repo
 
+- Make sure you've completed the steps in 'Setting up python'
 - Run interactive mode in the `update_golden.py` script.
   ```
   python3 test/renderdiff/src/update_golden.py
@@ -104,7 +106,7 @@ it in the following fashion
   ```
 - In the commit message of your working branch on `filament`, add the following line
   ```
-  RDIFF_BBRANCH=my-pr-branch-golden
+  RDIFF_BRANCH=my-pr-branch-golden
   ```
 
 Doing the above has multiple effects:
@@ -112,6 +114,24 @@ Doing the above has multiple effects:
   branch of the golden repo (i.e. `my-pr-branch-golden`).
 - If the PR is merged, then there is another workflow that will merge `my-pr-branch-golden`
   to the `main` branch of the golden repo.
+
+### Automated update via commit message
+
+Alternatively, if you are confident in your changes and want the CI to handle the update
+for you, you can use the following tag in your commit message:
+
+- In the commit message of your working branch on `filament`, add the following line:
+  ```
+  RDIFF_ACCEPT_NEW_GOLDENS
+  ```
+
+This has the following effects:
+- The presubmit test `test-renderdiff` will be bypassed (it will not perform rendering or
+  comparison).
+- When the PR is merged, the postsubmit CI will automatically:
+    1. Build Filament and generate the new images.
+    2. Upload them to a temporary branch in `filament-assets`.
+    3. Merge that branch into `main`.
 
 ## Viewing test results
 

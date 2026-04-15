@@ -127,23 +127,23 @@ DescriptorSetLayout getPerMaterialDescriptorSet(SamplerInterfaceBlock const& sib
     auto const& samplers = sib.getSamplerInfoList();
 
     DescriptorSetLayout layout;
-    layout.bindings.reserve(1 + samplers.size());
+    layout.descriptors.reserve(1 + samplers.size());
 
-    layout.bindings.push_back(DescriptorSetLayoutBinding{ DescriptorType::UNIFORM_BUFFER,
+    layout.descriptors.push_back(DescriptorSetLayoutDescriptor{ DescriptorType::UNIFORM_BUFFER,
         ShaderStageFlags::VERTEX | ShaderStageFlags::FRAGMENT,
         +PerMaterialBindingPoints::MATERIAL_PARAMS, DescriptorFlags::DYNAMIC_OFFSET, 0 });
 
     for (auto const& sampler: samplers) {
-        DescriptorSetLayoutBinding layoutBinding{
+        DescriptorSetLayoutDescriptor descriptor{
             DescriptorType::SAMPLER_EXTERNAL,
             sampler.stages, sampler.binding,
             DescriptorFlags::NONE,
             0
         };
         if (sampler.type != SamplerInterfaceBlock::Type::SAMPLER_EXTERNAL) {
-            layoutBinding.type = descriptor_sets::getDescriptorType(sampler.type, sampler.format);
+            descriptor.type = descriptor_sets::getDescriptorType(sampler.type, sampler.format);
         }
-        layout.bindings.push_back(layoutBinding);
+        layout.descriptors.push_back(descriptor);
     }
 
     return layout;
@@ -204,16 +204,16 @@ static void collectDescriptorsForSet(DescriptorSetBindingPoints set,
         return descriptor_sets::getDescriptorName(set, binding);
     };
 
-    for (auto const& layoutBinding : descriptorSetLayout.bindings) {
-        descriptor_binding_t binding = layoutBinding.binding;
+    for (auto const& descriptor : descriptorSetLayout.descriptors) {
+        descriptor_binding_t binding = descriptor.binding;
         auto name = getDescriptorName(binding);
-        if (DescriptorSetLayoutBinding::isSampler(layoutBinding.type)) {
+        if (DescriptorSetLayoutDescriptor::isSampler(descriptor.type)) {
             auto const pos = std::find_if(descriptorSetSamplerList.begin(), descriptorSetSamplerList.end(),
                     [&](const auto& entry) { return entry.binding == binding; });
             assert_invariant(pos != descriptorSetSamplerList.end());
-            descriptors.emplace_back(name, layoutBinding, *pos);
+            descriptors.emplace_back(name, descriptor, *pos);
         } else {
-            descriptors.emplace_back(name, layoutBinding, std::nullopt);
+            descriptors.emplace_back(name, descriptor, std::nullopt);
         }
     }
 
@@ -240,7 +240,7 @@ static void prettyPrintDescriptorSetInfoVector(DescriptorSets const& sets) noexc
         printf("[DS] info (%s) = [\n", getName(setIndex));
         for (auto const& descriptor : descriptors) {
             auto const& [name, info, sampler] = descriptor;
-        if (DescriptorSetLayoutBinding::isSampler(info.type)) {
+        if (DescriptorSetLayoutDescriptor::isSampler(info.type)) {
                 assert_invariant(sampler.has_value());
                 printf("    {name = %s, binding = %d, type = %.*s, count = %d, stage = %s, flags = "
                        "%s, samplerType = %s}",
@@ -752,15 +752,11 @@ bool GLSLPostProcessor::process(const std::string& inputShader, Config const& co
 
     if (internalConfig.glslOutput) {
         if (!mGenerateDebugInfo) {
-            *internalConfig.glslOutput =
-                    internalConfig.minifier.removeWhitespace(
-                            *internalConfig.glslOutput,
-                            mOptimization == MaterialBuilder::Optimization::SIZE);
-
+            *internalConfig.glslOutput = internalConfig.minifier.removeWhitespace( *internalConfig.glslOutput,
+                    mOptimization == MaterialBuilder::Optimization::SIZE);
             // In theory this should only be enabled for SIZE, but in practice we often use PERFORMANCE.
             if (mOptimization != MaterialBuilder::Optimization::NONE) {
-                *internalConfig.glslOutput =
-                        internalConfig.minifier.renameStructFields(*internalConfig.glslOutput);
+                *internalConfig.glslOutput = internalConfig.minifier.renameStructFields(*internalConfig.glslOutput);
             }
         }
         if (mPrintShaders) {
@@ -953,6 +949,38 @@ bool GLSLPostProcessor::fullOptimization(const TShader& tShader,
         size_t const found = str.find(clipDistanceDefinition);
         if (found != std::string::npos) {
             str.replace(found, clipDistanceDefinition.length(), "");
+        }
+
+        // Validate the transpiled ESSL1 shader dynamically before considering it successful.
+        // This proactively catches unsupported SPIR-V -> ESSL1 translation quirks (like textureLod)
+        // at compile-time since we can't easily test all variants on physical GLES 2.0 devices.
+        if (config.featureLevel == 0) {
+            // preampitively forbid spirv-cross from cheating and polyfilling disabled features
+            auto const& exts = glslCompiler.get_required_extensions();
+            for (auto const& ext : exts) {
+                if (ext != "GL_OES_standard_derivatives" &&
+                    ext != "GL_OES_EGL_image_external" &&
+                    ext != "GL_EXT_shader_framebuffer_fetch" &&
+                    ext != "GL_EXT_shader_framebuffer_fetch_non_coherent") {
+                    slog.e << "ERROR: Feature Level 0 shaders cannot require: " << ext << ". " 
+                           << "spirv-cross attempted to unilaterally inject it." << io::endl;
+                    return false;
+                }
+            }
+
+            TShader validateShader(internalConfig.shLang);
+            // The cleaner must be declared after the TShader to manage the glslang memory pool
+            // teardown order correctly and safely destroy the AST.
+            GLSLangCleaner const validateCleaner;
+
+            const char* shaderCString = str.c_str();
+            validateShader.setStrings(&shaderCString, 1);
+
+            bool const validateOk = validateShader.parse(&DefaultTBuiltInResource, glslOptions.version, false, EShMsgDefault);
+            if (!validateOk) {
+                slog.e << "ESSL1 Validation failed:\n" << validateShader.getInfoLog() << io::endl;
+                return false;
+            }
         }
     }
     return true;

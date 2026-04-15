@@ -71,11 +71,15 @@ public:
     void unbind(uint8_t setIndex);
 
     void commit(VulkanCommandBuffer* commands, VkPipelineLayout pipelineLayout,
-            fvkutils::DescriptorSetMask const& useExternalSamplerMask,
             fvkutils::DescriptorSetMask const& setMask);
 
     fvkmemory::resource_ptr<VulkanDescriptorSet> createSet(Handle<HwDescriptorSet> handle,
             fvkmemory::resource_ptr<VulkanDescriptorSetLayout> layout);
+
+    // Create and set as current a new VkDescriptorSet using the `set` currently bound layout and
+    // copy all the bindings and ignoring the samplers bindings in the `samplerMask`.
+    void cloneSet(fvkmemory::resource_ptr<VulkanDescriptorSet> set,
+            fvkutils::SamplerBitmask samplerMask) noexcept;
 
     // This method is meant to be used with external samplers
     VkDescriptorSet getVkSet(DescriptorCount const& count, VkDescriptorSetLayout vklayout);

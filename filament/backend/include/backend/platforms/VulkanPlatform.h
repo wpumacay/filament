@@ -28,9 +28,9 @@
 #include <utils/Hash.h>
 #include <utils/PrivateImplementation.h>
 
+#include <cstring>
 #include <cstddef>
 #include <functional>
-#include <string>
 #include <tuple>
 #include <unordered_set>
 
@@ -55,14 +55,31 @@ struct VulkanCmdFence;
  */
 class VulkanPlatform : public Platform, utils::PrivateImplementation<VulkanPlatformPrivate> {
 public:
+    /**
+     * Encapsulates information required to instantiate a known external format,
+     * typically for the purpose of preloading a pipeline cache for materials using
+     * external formats for samplers.
+     */
+    struct ExternalYcbcrFormat {
+        uint64_t externalFormat;
+        VkSamplerYcbcrModelConversion ycbcrModelConversion;
+        VkSamplerYcbcrRange ycbcrRange;
+    };
 
     struct ExtensionHashFn {
         std::size_t operator()(utils::CString const& s) const noexcept {
-            return std::hash<std::string>{}(s.data());
+            return std::hash<utils::CString>{}(s.data());
+        }
+    };
+    // Note: utils::CString::operator== has an edge case that breaks for the extension set.
+    // Instead, we'll provide our own comparator.
+    struct ExtensionEqualFn {
+        bool operator()(utils::CString const& a, utils::CString const& b) const noexcept {
+            return strcmp(a.c_str(), b.c_str()) == 0;
         }
     };
     // Utility for managing device or instance extensions during initialization.
-    using ExtensionSet = std::unordered_set<utils::CString, ExtensionHashFn>;
+    using ExtensionSet = std::unordered_set<utils::CString, ExtensionHashFn, ExtensionEqualFn>;
 
     /**
      * A collection of handles to objects and metadata that comprises a Vulkan context. The client
@@ -125,6 +142,8 @@ public:
         return 0;
     }
 
+    utils::CString getDeviceInfo(DeviceInfoType infoType, Driver* driver) const noexcept override;
+
     // ----------------------------------------------------
     // ---------- Platform Customization options ----------
     struct Customization {
@@ -157,6 +176,12 @@ public:
          * presentation. Default is true.
          */
         bool transitionSwapChainImageLayoutForPresent = true;
+
+        /**
+         * The number of frames before an unused framebuffer is evicted from the cache.
+         * Default is 3.
+         */
+        uint32_t timeBeforeEvictionFbo = 3;
     };
 
     /**
@@ -493,7 +518,42 @@ protected:
      */
     bool isTransientAttachmentSupported() const noexcept;
 
+    /**
+     * For pipeline cache prewarming, if external samplers are present, we need to build
+     * the fake pipeline using the proper formats specified. Since there's no way to
+     * get these at material build time, we allow the app to register them before
+     * creating materials.
+     *
+     * @param format The format, containing the external format value which should be
+     *               extracted from an AHardwareBuffer.
+     */
+    void registerPipelineCachePrewarmExternalFormat(const ExternalYcbcrFormat& format) noexcept;
+
 private:
+    /**
+     * Contains information about features that should be requested
+     * when calling vkCreateDevice, based on feature support from
+     * vkGetPhysicalDeviceFeatures2.
+     */
+    struct MiscDeviceFeatures {
+        /**
+         * This allows creation of a VkGraphicsPipeline without a
+         * render pass specified.
+         */
+        bool dynamicRendering;
+
+        /**
+         * Allows creation of a 2d image view, or 2d image view array,
+         * to be created from a 3d VkImage.
+         */
+        bool imageView2Don3DImage;
+
+        /**
+         * Desired global priority value for all VkQueue at a system level.
+         */
+        Platform::GpuContextPriority gpuContextPriority = Platform::GpuContextPriority::DEFAULT;
+    };
+
     void createInstance(ExtensionSet const& requiredExts) noexcept;
 
     void queryAndSetDeviceFeatures(Platform::DriverConfig const& driverConfig,
@@ -503,7 +563,7 @@ private:
     void createLogicalDeviceAndQueues(ExtensionSet const& deviceExtensions,
             VkPhysicalDeviceFeatures const& features,
             VkPhysicalDeviceVulkan11Features const& vk11Features, bool createProtectedQueue,
-            bool requestImageView2DOn3DImage) noexcept;
+            MiscDeviceFeatures const& requestedFeatures) noexcept;
 
     friend struct VulkanPlatformPrivate;
 };

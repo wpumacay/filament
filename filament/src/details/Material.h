@@ -18,6 +18,7 @@
 #define TNT_FILAMENT_DETAILS_MATERIAL_H
 
 #include "downcast.h"
+#include "LocalProgramCache.h"
 
 #include "details/MaterialInstance.h"
 
@@ -45,8 +46,6 @@
 #include <utils/Invocable.h>
 #include <utils/Mutex.h>
 
-#include <array>
-#include <optional>
 #include <string_view>
 
 #include <stddef.h>
@@ -73,7 +72,6 @@ public:
         DefaultMaterialBuilder();
     };
 
-
     void terminate(FEngine& engine);
 
     // return the uniform interface block for this material
@@ -82,12 +80,14 @@ public:
     }
 
     DescriptorSetLayout const& getPerViewDescriptorSetLayout() const noexcept {
-        assert_invariant(mDefinition.materialDomain == MaterialDomain::POST_PROCESS);
-        return mDefinition.perViewDescriptorSetLayout;
+        // This is mostly intended to be used for post-process materials; but it's also useful for
+        // Surface material that behave like post-process material (i.e. that don't really have variants or for
+        // which VSM is nonsensical, like for unlit materials)
+        return mDefinition.perViewDescriptorSetLayoutPcf;
     }
 
     DescriptorSetLayout const& getPerViewDescriptorSetLayout(
-            Variant const variant, bool const useVsmDescriptorSetLayout) const noexcept;
+            Variant variant, bool useVsmDescriptorSetLayout) const noexcept;
 
     // Returns the layout that should be used when this material is bound to the pipeline for the
     // given variant. Shared variants use the Engine's default material's variants, so we should
@@ -106,7 +106,12 @@ public:
     void compile(CompilerPriorityQueue priority,
             UserVariantFilterMask variantSpec,
             backend::CallbackHandler* handler,
-            utils::Invocable<void(Material*)>&& callback) noexcept;
+            utils::Invocable<void(Material*)>&& callback) const noexcept;
+
+    void compile(CompilerPriorityQueue priority,
+        utils::FixedCapacityVector<Variant> const& variants,
+        backend::CallbackHandler* handler,
+        utils::Invocable<void(Material*)>&& callback) const noexcept;
 
     // Creates an instance of this material, specifying the batching mode.
     FMaterialInstance* createInstance(const char* name) const noexcept;
@@ -125,32 +130,38 @@ public:
 
     FEngine& getEngine() const noexcept  { return mEngine; }
 
-    bool isCached(Variant const variant) const noexcept {
-        return bool(mCachedPrograms[variant.key]);
-    }
-
-    void invalidate(Variant::type_t variantMask = 0, Variant::type_t variantValue = 0) noexcept;
-
     // prepareProgram creates the program for the material's given variant at the backend level.
     // Must be called outside of backend render pass.
     // Must be called before getProgram() below.
-    void prepareProgram(Variant const variant,
+    backend::Handle<backend::HwProgram> prepareProgram(backend::DriverApi& driver,
+            Variant const variant,
             backend::CompilerPriorityQueue const priorityQueue) const noexcept {
-        // prepareProgram() is called for each RenderPrimitive in the scene, so it must be efficient.
-        if (UTILS_UNLIKELY(!isCached(variant))) {
-            prepareProgramSlow(variant, priorityQueue);
-        }
+        return mPrograms.prepareProgram(driver, variant, priorityQueue);
     }
 
     // getProgram returns the backend program for the material's given variant.
     // Must be called after prepareProgram().
     [[nodiscard]]
-    backend::Handle<backend::HwProgram> getProgram(Variant const variant) const noexcept {
+    backend::Handle<backend::HwProgram> getProgram(Variant variant) const noexcept {
+
+        if (UTILS_UNLIKELY(mEngine.features.material.enable_fog_as_postprocess)) {
+            // if the fog as post-process feature is enabled, we need to proceed "as-if" the material
+            // didn't have the FOG variant bit.
+            if (getMaterialDomain() == MaterialDomain::SURFACE) {
+                BlendingMode const blendingMode = getBlendingMode();
+                bool const hasScreenSpaceRefraction = getRefractionMode() == RefractionMode::SCREEN_SPACE;
+                bool const isBlendingCommand = !hasScreenSpaceRefraction &&
+                        (blendingMode != BlendingMode::OPAQUE && blendingMode != BlendingMode::MASKED);
+                if (!isBlendingCommand) {
+                    variant.setFog(false);
+                }
+            }
+        }
+
 #if FILAMENT_ENABLE_MATDBG
-        return getProgramWithMATDBG(variant);
+        updateActiveProgramsForMatdbg(variant);
 #endif
-        assert_invariant(mCachedPrograms[variant.key]);
-        return mCachedPrograms[variant.key];
+        return mPrograms.getProgram(variant);
     }
 
     // MaterialInstance::use() binds descriptor sets before drawing. For shared variants,
@@ -169,9 +180,6 @@ public:
         pDefaultInstance->use(driver, variant);
         return true;
     }
-
-    [[nodiscard]]
-    backend::Handle<backend::HwProgram> getProgramWithMATDBG(Variant variant) const noexcept;
 
     bool isVariantLit() const noexcept { return mDefinition.isVariantLit; }
 
@@ -210,6 +218,8 @@ public:
     float getSpecularAntiAliasingVariance() const noexcept { return mDefinition.specularAntiAliasingVariance; }
     float getSpecularAntiAliasingThreshold() const noexcept { return mDefinition.specularAntiAliasingThreshold; }
 
+    bool isDefaultMaterial() const noexcept { return mIsDefaultMaterial; }
+
     backend::descriptor_binding_t getSamplerBinding(
             std::string_view const& name) const;
 
@@ -232,17 +242,7 @@ public:
 
     uint32_t generateMaterialInstanceId() const noexcept { return mMaterialInstanceId++; }
 
-    void destroyPrograms(FEngine& engine,
-            Variant::type_t variantMask = 0,
-            Variant::type_t variantValue = 0);
-
-    // return the id of a specialization constant specified by name for this material
-    std::optional<uint32_t> getSpecializationConstantId(std::string_view name) const noexcept ;
-
-    // Sets a specialization constant by id. call is no-op if the id is invalid.
-    // Return true is the value was changed.
-    template<typename T, typename = Builder::is_supported_constant_parameter_t<T>>
-    bool setConstant(uint32_t id, T value) noexcept;
+    LocalProgramCache& getPrograms() noexcept { return mPrograms; }
 
     uint8_t getPerViewLayoutIndex() const noexcept {
         return mDefinition.perViewLayoutIndex;
@@ -255,6 +255,30 @@ public:
     std::string_view getSource() const noexcept {
         return mDefinition.source.c_str_safe();
     }
+
+    inline bool isSharedVariant(Variant const variant) const {
+        // HACK: The default material "should" have MNT | DEP, but then we'd have to compile it as a
+        // lit material, which would increase binary size. Perhaps we could specially compile it
+        // with this variant, but with the shader program cache in active development, the days of
+        // the default material are numbered anyway.
+        constexpr Variant::type_t vsmAndDep = Variant::MNT | Variant::DEP;
+        return mDefinition.materialDomain == MaterialDomain::SURFACE && !mIsDefaultMaterial &&
+               !mDefinition.hasCustomDepthShader && Variant::isValidDepthVariant(variant) &&
+               (variant.key & vsmAndDep) != vsmAndDep;
+    }
+
+    MaterialParser const& getMaterialParser() const noexcept {
+#if FILAMENT_ENABLE_MATDBG
+        if (mEditedMaterialParser) {
+            return *mEditedMaterialParser;
+        }
+#endif
+        return mDefinition.getMaterialParser();
+    }
+
+    MaterialDefinition const& getDefinition() const noexcept { return mDefinition; }
+
+    LocalProgramCache const& getPrograms() const noexcept { return mPrograms; }
 
 #if FILAMENT_ENABLE_MATDBG
     void applyPendingEdits() noexcept;
@@ -289,42 +313,26 @@ public:
 #endif
 
 private:
-    MaterialParser const& getMaterialParser() const noexcept;
-
-    bool hasVariant(Variant variant) const noexcept;
-    void prepareProgramSlow(Variant variant,
-            CompilerPriorityQueue priorityQueue) const noexcept;
-    void getSurfaceProgramSlow(Variant variant,
-            CompilerPriorityQueue priorityQueue) const noexcept;
-    void getPostProcessProgramSlow(Variant variant,
-            CompilerPriorityQueue priorityQueue) const noexcept;
-    backend::Program getProgramWithVariants(Variant variant,
-            Variant vertexVariant, Variant fragmentVariant) const;
-
     utils::FixedCapacityVector<backend::Program::SpecializationConstant>
             processSpecializationConstants(Builder const& builder);
 
-    void precacheDepthVariants(FEngine& engine);
+    void compileAllPrograms(CompilerPriorityQueue priority,
+        backend::CallbackHandler* handler,
+        utils::Invocable<void(Material*)>&& callback) const noexcept;
 
-    void createAndCacheProgram(backend::Program&& p, Variant variant) const noexcept;
-
-    inline bool isSharedVariant(Variant const variant) const {
-        return (mDefinition.materialDomain == MaterialDomain::SURFACE) && !mIsDefaultMaterial &&
-               !mDefinition.hasCustomDepthShader && Variant::isValidDepthVariant(variant);
-    }
-
-    mutable std::array<backend::Handle<backend::HwProgram>, VARIANT_COUNT> mCachedPrograms;
     MaterialDefinition const& mDefinition;
 
     bool mIsDefaultMaterial = false;
 
     bool mUseUboBatching = false;
+    bool mIsStereoSupported = false;
+    bool mIsParallelShaderCompileSupported = false;
+    bool mDepthPrecacheDisabled = false;
+
+    FMaterial const* mDefaultMaterial = nullptr;
 
     // reserve some space to construct the default material instance
     mutable FMaterialInstance* mDefaultMaterialInstance = nullptr;
-
-    // current specialization constants for the HwProgram
-    utils::FixedCapacityVector<backend::Program::SpecializationConstant> mSpecializationConstants;
 
 #if FILAMENT_ENABLE_MATDBG
     matdbg::MaterialKey mDebuggerId;
@@ -333,6 +341,8 @@ private:
     mutable utils::Mutex mPendingEditsLock;
     std::unique_ptr<MaterialParser> mPendingEdits;
     std::unique_ptr<MaterialParser> mEditedMaterialParser;
+    // Called by getProgram() to update active program list for matdbg UI.
+    void updateActiveProgramsForMatdbg(Variant const variant) const noexcept;
     void setPendingEdits(std::unique_ptr<MaterialParser> pendingEdits) noexcept;
     bool hasPendingEdits() const noexcept;
     void latchPendingEdits() noexcept;
@@ -341,6 +351,8 @@ private:
     FEngine& mEngine;
     const uint32_t mMaterialId;
     mutable uint32_t mMaterialInstanceId = 0;
+
+    LocalProgramCache mPrograms;
 };
 
 

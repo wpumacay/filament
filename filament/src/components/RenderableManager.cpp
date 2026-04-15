@@ -55,6 +55,7 @@
 #include <math/vec4.h>
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -68,8 +69,33 @@ using namespace filament::math;
 using namespace utils;
 
 namespace filament {
+namespace {
+
+RenderableManager::Builder::MorphType morphTargetBufferToBuildType(
+        const MorphTargetBuffer* const buffer, size_t const morphTargetCount) {
+    using MorphType = RenderableManager::Builder::MorphType;
+    if (!buffer || morphTargetCount == 0) {
+        return MorphType::NONE;
+    }
+
+    auto type = static_cast<uint8_t>(MorphType::NONE);
+    if (buffer->hasPositions()) {
+        type |= static_cast<uint8_t>(MorphType::POSITION);
+    }
+
+    if (buffer->hasTangents()) {
+        type |= static_cast<uint8_t>(MorphType::TANGENT);
+    }
+
+    if (buffer->isCustomMorphingEnabled()) {
+        type |= static_cast<uint8_t>(MorphType::CUSTOM);
+    }
+
+    return static_cast<MorphType>(type);
+}
 
 using namespace backend;
+} // anonymous namespace
 
 struct RenderableManager::BuilderDetails {
     using Entry = FRenderableManager::Entry;
@@ -452,6 +478,9 @@ RenderableManager::Builder::Result RenderableManager::Builder::build(Engine& eng
     FILAMENT_CHECK_PRECONDITION(mImpl->mSkinningBoneCount <= CONFIG_MAX_BONE_COUNT)
             << "bone count > " << CONFIG_MAX_BONE_COUNT;
 
+    FILAMENT_CHECK_PRECONDITION(mImpl->mSkinningBufferOffset <= std::numeric_limits<uint16_t>::max())
+            << "skinning buffer offset > " << std::numeric_limits<uint16_t>::max();
+
     FILAMENT_CHECK_PRECONDITION(
             mImpl->mInstanceCount <= CONFIG_MAX_INSTANCES || !mImpl->mInstanceBuffer)
             << "instance count is " << mImpl->mInstanceCount
@@ -552,7 +581,7 @@ void FRenderableManager::create(
     FEngine::DriverApi& driver = engine.getDriverApi();
 
     if (UTILS_UNLIKELY(manager.hasComponent(entity))) {
-        destroy(entity);
+        destroy(entity, driver);
     }
     Instance const ci = manager.addComponent(entity);
     assert_invariant(ci);
@@ -578,11 +607,12 @@ void FRenderableManager::create(
         setScreenSpaceContactShadows(ci, builder->mScreenSpaceContactShadows);
         setCulling(ci, builder->mCulling);
         setSkinning(ci, false);
-        setMorphing(ci, builder->mMorphTargetCount);
+        setMorphing(ci, morphTargetBufferToBuildType(builder->mMorphTargetBuffer,
+                                builder->mMorphTargetCount));
         setFogEnabled(ci, builder->mFogEnabled);
         // do this after calling setAxisAlignedBoundingBox
         static_cast<Visibility&>(mManager[ci].visibility).geometryType = builder->mGeometryType;
-        mManager[ci].channels = builder->mLightChannels;
+        mManager[ci].lightChannels = builder->mLightChannels;
 
         InstancesInfo& instances = manager[ci].instances;
         instances.count = builder->mInstanceCount;
@@ -707,41 +737,42 @@ void FRenderableManager::create(
 }
 
 // this destroys a single component from an entity
-void FRenderableManager::destroy(Entity const e) noexcept {
+void FRenderableManager::destroy(Entity const e, DriverApi& driver) noexcept {
     Instance const ci = getInstance(e);
     if (ci) {
-        destroyComponent(ci);
+        destroyComponent(ci, driver);
         mManager.removeComponent(e);
     }
 }
 
+void FRenderableManager::clientDestroy(utils::Entity e) noexcept {
+    destroy(e, mEngine.getDriverApi());
+}
+
 // this destroys all components in this manager
-void FRenderableManager::terminate() noexcept {
+void FRenderableManager::terminate(DriverApi& driver) noexcept {
     auto& manager = mManager;
     if (!manager.empty()) {
         DLOG(INFO) << "cleaning up " << manager.getComponentCount()
                    << " leaked Renderable components";
         while (!manager.empty()) {
             Instance const ci = manager.end() - 1;
-            destroyComponent(ci);
+            destroyComponent(ci, driver);
             manager.removeComponent(manager.getEntity(ci));
         }
     }
-    mHwRenderPrimitiveFactory.terminate(mEngine.getDriverApi());
+    mHwRenderPrimitiveFactory.terminate(driver);
 }
 
-void FRenderableManager::gc(EntityManager& em) noexcept {
-    mManager.gc(em, [this](Entity const e) {
-        destroy(e);
+void FRenderableManager::gc(EntityManager& em, DriverApi& driver) noexcept {
+    mManager.gc(em, [this, &driver](Entity const e) {
+        destroy(e, driver);
     });
 }
 
 // This is basically a Renderable's destructor.
-void FRenderableManager::destroyComponent(Instance const ci) noexcept {
+void FRenderableManager::destroyComponent(Instance const ci, DriverApi& driver) noexcept {
     auto& manager = mManager;
-    FEngine& engine = mEngine;
-
-    FEngine::DriverApi& driver = engine.getDriverApi();
 
     // See create(RenderableManager::Builder&, Entity)
     destroyComponentPrimitives(mHwRenderPrimitiveFactory, driver, manager[ci].primitives);
@@ -781,7 +812,7 @@ void FRenderableManager::setMaterialInstanceAt(Instance const instance, uint8_t 
     assert_invariant(mi);
     if (instance) {
         Slice<FRenderPrimitive> primitives = getRenderPrimitives(instance, level);
-        if (primitiveIndex < primitives.size() && mi) {
+        if (primitiveIndex < primitives.size()) {
             FMaterial const* material = mi->getMaterial();
 
             // we want a feature level violation to be a hard error (exception if enabled, or crash)
@@ -838,6 +869,17 @@ void FRenderableManager::setBlendOrderAt(Instance const instance, uint8_t const 
     }
 }
 
+uint16_t FRenderableManager::getBlendOrderAt(Instance const instance, uint8_t const level,
+        size_t const primitiveIndex) const noexcept {
+    if (instance) {
+        Slice<const FRenderPrimitive> primitives = getRenderPrimitives(instance, level);
+        if (primitiveIndex < primitives.size()) {
+            return primitives[primitiveIndex].getBlendOrder();
+        }
+    }
+    return 0;
+}
+
 void FRenderableManager::setGlobalBlendOrderEnabledAt(Instance const instance, uint8_t const level,
         size_t const primitiveIndex, bool const enabled) noexcept {
     if (instance) {
@@ -846,6 +888,17 @@ void FRenderableManager::setGlobalBlendOrderEnabledAt(Instance const instance, u
             primitives[primitiveIndex].setGlobalBlendOrderEnabled(enabled);
         }
     }
+}
+
+bool FRenderableManager::isGlobalBlendOrderEnabledAt(Instance const instance, uint8_t const level,
+        size_t const primitiveIndex) const noexcept {
+    if (instance) {
+        Slice<const FRenderPrimitive> primitives = getRenderPrimitives(instance, level);
+        if (primitiveIndex < primitives.size()) {
+            return primitives[primitiveIndex].isGlobalBlendOrderEnabled();
+        }
+    }
+    return false;
 }
 
 AttributeBitset FRenderableManager::getEnabledAttributesAt(
@@ -879,6 +932,9 @@ void FRenderableManager::setBones(Instance const ci,
         FILAMENT_CHECK_PRECONDITION(!bones.skinningBufferMode)
                 << "Disable skinning buffer mode to use this API";
 
+        FILAMENT_CHECK_PRECONDITION(offset <= bones.count)
+                << "bone offset is out of bounds (" << offset << " > " << bones.count << ")";
+
         assert_invariant(bones.handle && offset + boneCount <= bones.count);
         if (bones.handle) {
             boneCount = std::min(boneCount, bones.count - offset);
@@ -894,6 +950,9 @@ void FRenderableManager::setBones(Instance const ci,
 
         FILAMENT_CHECK_PRECONDITION(!bones.skinningBufferMode)
                 << "Disable skinning buffer mode to use this API";
+
+        FILAMENT_CHECK_PRECONDITION(offset <= bones.count)
+                << "bone offset is out of bounds (" << offset << " > " << bones.count << ")";
 
         assert_invariant(bones.handle && offset + boneCount <= bones.count);
         if (bones.handle) {
@@ -988,8 +1047,8 @@ void FRenderableManager::setLightChannel(Instance const ci, unsigned int const c
     if (ci) {
         if (channel < 8) {
             const uint8_t mask = 1u << channel;
-            mManager[ci].channels &= ~mask;
-            mManager[ci].channels |= enable ? mask : 0u;
+            mManager[ci].lightChannels &= ~mask;
+            mManager[ci].lightChannels |= enable ? mask : 0u;
         }
     }
 }
@@ -998,7 +1057,7 @@ bool FRenderableManager::getLightChannel(Instance const ci, unsigned int const c
     if (ci) {
         if (channel < 8) {
             const uint8_t mask = 1u << channel;
-            return bool(mManager[ci].channels & mask);
+            return bool(mManager[ci].lightChannels & mask);
         }
     }
     return false;

@@ -289,8 +289,7 @@ void VulkanDescriptorSetCache::unbind(uint8_t setIndex) {
 }
 
 void VulkanDescriptorSetCache::commit(VulkanCommandBuffer* commands,
-        VkPipelineLayout pipelineLayout, fvkutils::DescriptorSetMask const& useExternalSamplers,
-        fvkutils::DescriptorSetMask const& setMask) {
+        VkPipelineLayout pipelineLayout, fvkutils::DescriptorSetMask const& setMask) {
     // setMask indicates the set of descriptor sets the driver wants to bind, curMask is the
     // actual set of sets that *needs* to be bound.
     fvkutils::DescriptorSetMask curMask = setMask;
@@ -306,8 +305,7 @@ void VulkanDescriptorSetCache::commit(VulkanCommandBuffer* commands,
         auto& lastBoundSets = mLastBoundInfo.boundSets;
         curMask.forEachSetBit([&](size_t index) {
             auto& set = updateSets[index];
-            if (set == lastBoundSets[index] && !useExternalSamplers[index] &&
-                    set->uniqueDynamicUboCount == 0) {
+            if (set == lastBoundSets[index] && set->uniqueDynamicUboCount == 0) {
                 curMask.unset(index);
             }
         });
@@ -359,32 +357,6 @@ void VulkanDescriptorSetCache::updateBuffer(fvkmemory::resource_ptr<VulkanDescri
 void VulkanDescriptorSetCache::updateSampler(fvkmemory::resource_ptr<VulkanDescriptorSet> set,
         uint8_t binding, fvkmemory::resource_ptr<VulkanTexture> texture,
         VkSampler sampler, VkDescriptorSetLayout externalSamplerLayout) noexcept {
-
-    // We have to update a bound set for two use cases
-    //   - streaming API (a changing feed of AHardwareBuffer)
-    //   - external samplers - potential changing of dataspace per-frame
-    if (UTILS_UNLIKELY(set->isBound())) {
-        auto layout = set->getLayout();
-        // Build a new descriptor set from the new layout
-        auto genLayout = externalSamplerLayout != VK_NULL_HANDLE ?
-                externalSamplerLayout : layout->getVkLayout();
-        VkDescriptorSet const newSet = getVkSet(layout->count, genLayout);
-        Bitmask const ubo = layout->bitmask.ubo | layout->bitmask.dynamicUbo;
-        Bitmask samplers = layout->bitmask.sampler;
-        samplers.unset(binding);
-
-        // Each bitmask denotes a binding index, and separated into two stages - vertex and buffer
-        // We fold the two stages into just the lower half of the bits to denote a combined set of
-        // bindings.
-        Bitmask const copyBindings = foldBitsInHalf(ubo | samplers);
-        VkDescriptorSet const srcSet = set->getVkSet();
-        copySet(srcSet, newSet, copyBindings);
-        set->addNewSet(newSet,
-                [this, layoutCount = layout->count, genLayout, newSet](VulkanDescriptorSet*) {
-                    this->manualRecycle(layoutCount, genLayout, newSet);
-                });
-    }
-
     VkDescriptorSet const vkset = set->getVkSet();
     VkImageSubresourceRange range = texture->getPrimaryViewRange();
     VkImageViewType const expectedType = texture->getViewType();
@@ -431,6 +403,28 @@ fvkmemory::resource_ptr<VulkanDescriptorSet> VulkanDescriptorSetCache::createSet
                     VulkanDescriptorSet*) { this->manualRecycle(count, vklayout, vkSet); },
             vkSet);
     return set;
+}
+
+void VulkanDescriptorSetCache::cloneSet(fvkmemory::resource_ptr<VulkanDescriptorSet> set,
+        fvkutils::SamplerBitmask samplerMask) noexcept {
+    auto const& layout = set->getLayout();
+    // Build a new descriptor set from layout
+    VkDescriptorSetLayout const genLayout = set->boundLayout;
+    VkDescriptorSet const newSet = getVkSet(layout->count, genLayout);
+
+    // Each bitmask denotes a binding index, and separated into two stages - vertex and buffer
+    // We fold the two stages into just the lower half of the bits to denote a combined set of
+    // bindings.
+    Bitmask const ubo = layout->bitmask.ubo | layout->bitmask.dynamicUbo;
+    // Don't copy the samplers in the mask
+    Bitmask samplers = layout->bitmask.sampler ^ samplerMask;
+    Bitmask const copyBindings = foldBitsInHalf(ubo | samplers);
+
+    VkDescriptorSet const srcSet = set->getVkSet();
+    copySet(srcSet, newSet, copyBindings);
+    set->addNewSet(newSet,
+            [this, layoutCount = layout->count, genLayout, newSet](
+                    VulkanDescriptorSet*) { this->manualRecycle(layoutCount, genLayout, newSet); });
 }
 
 VkDescriptorSet VulkanDescriptorSetCache::getVkSet(DescriptorCount const& count,

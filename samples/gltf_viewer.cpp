@@ -46,7 +46,7 @@
 
 #include <private/filament/EngineEnums.h>
 
-#include <getopt/getopt.h>
+#include <utils/getopt.h>
 
 #include <utils/NameComponentManager.h>
 #include <utils/Log.h>
@@ -219,29 +219,29 @@ static std::ifstream::pos_type getFileSize(const char* filename) {
 
 static int handleCommandLineArguments(int argc, char* argv[], App* app) {
     static constexpr const char* OPTSTR = "ha:f:i:usc:rt:y:b:evg:dw:";
-    static const struct option OPTIONS[] = {
-        { "help",              no_argument,          nullptr, 'h' },
-        { "api",               required_argument,    nullptr, 'a' },
-        { "feature-level",     required_argument,    nullptr, 'f' },
-        { "batch",             required_argument,    nullptr, 'b' },
-        { "headless",          no_argument,          nullptr, 'e' },
-        { "ibl",               required_argument,    nullptr, 'i' },
-        { "ubershader",        no_argument,          nullptr, 'u' },
-        { "actual-size",       no_argument,          nullptr, 's' },
-        { "camera",            required_argument,    nullptr, 'c' },
-        { "eyes",              required_argument,    nullptr, 'y' },
-        { "recompute-aabb",    no_argument,          nullptr, 'r' },
-        { "settings",          required_argument,    nullptr, 't' },
-        { "split-view",        no_argument,          nullptr, 'v' },
-        { "vulkan-gpu-hint",   required_argument,    nullptr, 'g' },
-        { "screenshot-as-ppm", no_argument,          nullptr, 'd' },
-        { "webgpu-backend",    required_argument,    nullptr, 'w' },
+    static const utils::getopt::option OPTIONS[] = {
+        { "help",              utils::getopt::no_argument,          nullptr, 'h' },
+        { "api",               utils::getopt::required_argument,    nullptr, 'a' },
+        { "feature-level",     utils::getopt::required_argument,    nullptr, 'f' },
+        { "batch",             utils::getopt::required_argument,    nullptr, 'b' },
+        { "headless",          utils::getopt::no_argument,          nullptr, 'e' },
+        { "ibl",               utils::getopt::required_argument,    nullptr, 'i' },
+        { "ubershader",        utils::getopt::no_argument,          nullptr, 'u' },
+        { "actual-size",       utils::getopt::no_argument,          nullptr, 's' },
+        { "camera",            utils::getopt::required_argument,    nullptr, 'c' },
+        { "eyes",              utils::getopt::required_argument,    nullptr, 'y' },
+        { "recompute-aabb",    utils::getopt::no_argument,          nullptr, 'r' },
+        { "settings",          utils::getopt::required_argument,    nullptr, 't' },
+        { "split-view",        utils::getopt::no_argument,          nullptr, 'v' },
+        { "vulkan-gpu-hint",   utils::getopt::required_argument,    nullptr, 'g' },
+        { "screenshot-as-ppm", utils::getopt::no_argument,          nullptr, 'd' },
+        { "webgpu-backend",    utils::getopt::required_argument,    nullptr, 'w' },
         { nullptr, 0, nullptr, 0 }
     };
     int opt;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, OPTSTR, OPTIONS, &option_index)) >= 0) {
-        std::string const arg(optarg ? optarg : "");
+    while ((opt = utils::getopt::getopt_long(argc, argv, OPTSTR, OPTIONS, &option_index)) >= 0) {
+        std::string const arg(utils::getopt::optarg ? utils::getopt::optarg : "");
         switch (opt) {
             default:
             case 'h':
@@ -327,7 +327,7 @@ static int handleCommandLineArguments(int argc, char* argv[], App* app) {
         std::cerr << "--headless is allowed only when --batch is present." << std::endl;
         app->config.headless = false;
     }
-    return optind;
+    return utils::getopt::optind;
 }
 
 static bool loadSettings(const char* filename, Settings* out) {
@@ -781,7 +781,10 @@ int main(int argc, char** argv) {
                                            ? AutomationEngine::Options::ExportFormat::PPM
                                            : AutomationEngine::Options::ExportFormat::TIFF;
             app.automationEngine->setOptions(options);
-            app.viewer->stopAnimation();
+            app.viewer->getSettings().animation.enabled = false;
+        } else {
+            // Enable animation by default for interactive mode (non-batch mode).
+            app.viewer->getSettings().animation.enabled = true;
         }
 
         if (!app.settingsFile.empty()) {
@@ -1014,16 +1017,10 @@ int main(int argc, char** argv) {
 #endif
                 const auto overdrawVisibilityBit = (1u << App::Scene::OVERDRAW_VISIBILITY_LAYER);
                 bool visualizeOverdraw = view->getVisibleLayers() & overdrawVisibilityBit;
-                // TODO: enable after stencil buffer supported is added for Vulkan.
-                const bool overdrawDisabled = engine->getBackend() == backend::Backend::VULKAN;
-                ImGui::BeginDisabled(overdrawDisabled);
-                ImGui::Checkbox(!overdrawDisabled ? "Visualize overdraw"
-                                                  : "Visualize overdraw (disabled for Vulkan)",
-                        &visualizeOverdraw);
-                ImGui::EndDisabled();
+                ImGui::Checkbox("Visualize overdraw", &visualizeOverdraw);
                 view->setVisibleLayers(overdrawVisibilityBit,
                         (uint8_t)visualizeOverdraw << App::Scene::OVERDRAW_VISIBILITY_LAYER);
-                view->setStencilBufferEnabled(visualizeOverdraw);
+                app.viewer->getSettings().view.stencilBufferEnabled = visualizeOverdraw;
             }
 
             if (ImGui::BeginPopupModal("MessageBox", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -1084,7 +1081,16 @@ int main(int argc, char** argv) {
         // Gradually add renderables to the scene as their textures become ready.
         app.viewer->populateScene();
 
-        app.viewer->applyAnimation(now);
+        auto const& animSettings = app.viewer->getSettings().animation;
+        if (animSettings.enabled) {
+            double animTime = now;
+            if (animSettings.time >= 0.0f) {
+                animTime = animSettings.time;
+            } else {
+                animTime *= animSettings.speed;
+            }
+            app.viewer->applyAnimation(animTime);
+        }
     };
 
     auto resize = [&app](Engine*, View* view) {
@@ -1116,13 +1122,21 @@ int main(int argc, char** argv) {
 
         // Note that this focal length might be different from the slider value because the
         // automation engine applies Camera::computeEffectiveFocalLength when DoF is enabled.
-        FilamentApp::get().setCameraFocalLength(viewerOptions.cameraFocalLength);
-        FilamentApp::get().setCameraNearFar(viewerOptions.cameraNear, viewerOptions.cameraFar);
+        float focalLength = app.viewer->getSettings().camera.focalLength;
+        float const focusDistance = app.viewer->getSettings().camera.focusDistance;
+        if (app.viewer->getSettings().view.dof.enabled) {
+            focalLength = Camera::computeEffectiveFocalLength(focalLength / 1000.0,
+                                  std::max(0.1f, focusDistance)) *
+                          1000.0;
+        }
+        FilamentApp::get().setCameraFocalLength(focalLength);
+        FilamentApp::get().setCameraNearFar(app.viewer->getSettings().camera.near,
+                app.viewer->getSettings().camera.far);
 
-        const size_t cameraCount = app.asset->getCameraEntityCount();
+        size_t const cameraCount = app.asset->getCameraEntityCount();
         view->setCamera(app.mainCamera);
 
-        const int currentCamera = app.viewer->getCurrentCamera();
+        int const currentCamera = app.viewer->getCurrentCamera();
         if (currentCamera > 0 && currentCamera <= cameraCount) {
             const utils::Entity* cameras = app.asset->getCameraEntities();
             Camera* camera = engine->getCameraComponent(cameras[currentCamera - 1]);
@@ -1150,8 +1164,11 @@ int main(int argc, char** argv) {
         Camera& camera = view->getCamera();
         Skybox* skybox = scene->getSkybox();
         applySettings(engine, app.viewer->getSettings().viewer, &camera, skybox, renderer);
+        double const aspect =
+                (double) view->getViewport().width / (double) view->getViewport().height;
+        applySettings(engine, app.viewer->getSettings().camera, &camera, aspect);
 
-        // FIMXE: This applySettings() is done here instead of in AutomationEngine.cpp because
+        // FIXME: This applySettings() is done here instead of in AutomationEngine.cpp because
         // we need access to the Renderer, which AutomationEngine does not provide.
         applySettings(engine, app.viewer->getSettings().debug, renderer);
 
@@ -1183,7 +1200,7 @@ int main(int argc, char** argv) {
         }
     };
 
-    auto postRender = [&app](Engine* engine, View* view, Scene*, Renderer* renderer) {
+    auto postRender = [&app](Engine* engine, View* view, Scene* scene, Renderer* renderer) {
         if (app.screenshot) {
             std::ostringstream stringStream;
             stringStream << "screenshot" << std::setfill('0') << std::setw(2) << +app.screenshotSeq;
@@ -1202,6 +1219,12 @@ int main(int argc, char** argv) {
             .renderer = renderer,
             .materials = app.instance->getMaterialInstances(),
             .materialCount = app.instance->getMaterialInstanceCount(),
+            .lightManager = &engine->getLightManager(),
+            .scene = scene,
+            .indirectLight = app.viewer->getIndirectLight(),
+            .sunlight = app.viewer->getSunlight(),
+            .assetLights = app.asset->getLightEntities(),
+            .assetLightCount = app.asset->getLightEntityCount(),
         };
         app.automationEngine->tick(engine, content, ImGui::GetIO().DeltaTime);
     };

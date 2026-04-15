@@ -20,6 +20,11 @@
 #include "TextureCache.h"
 #include "RenderPrimitive.h"
 
+#include "components/CameraManager.h"
+#include "components/LightManager.h"
+#include "components/RenderableManager.h"
+#include "components/TransformManager.h"
+
 #include "details/BufferObject.h"
 #include "details/Camera.h"
 #include "details/Fence.h"
@@ -39,31 +44,36 @@
 #include "details/VertexBuffer.h"
 #include "details/View.h"
 
-#include <filament/ColorGrading.h>
-#include <filament/Engine.h>
-#include <filament/MaterialEnums.h>
-
 #include <private/filament/DescriptorSets.h>
 #include <private/filament/EngineEnums.h>
 #include <private/filament/Variant.h>
 
 #include <private/backend/PlatformFactory.h>
 
-#include <backend/DriverEnums.h>
-
+#include <private/utils/FeatureFlagManager.h>
 #include <private/utils/Tracing.h>
+
+#include <filament/ColorGrading.h>
+#include <filament/Engine.h>
+#include <filament/MaterialEnums.h>
+
+#include <backend/DriverEnums.h>
 
 #include <utils/Allocator.h>
 #include <utils/CallStack.h>
 #include <utils/CString.h>
+#include <utils/FixedCapacityVector.h>
 #include <utils/Invocable.h>
+#include <utils/JobSystem.h>
 #include <utils/Logger.h>
 #include <utils/Panic.h>
 #include <utils/PrivateImplementation-impl.h>
+#include <utils/Slice.h>
 #include <utils/ThreadUtils.h>
 #include <utils/compiler.h>
 #include <utils/debug.h>
 #include <utils/ostream.h>
+#include <utils/tribool.h>
 
 #include <math/vec3.h>
 #include <math/vec4.h>
@@ -98,8 +108,9 @@ using namespace filaflat;
 
 namespace {
 
-backend::Platform::DriverConfig getDriverConfig(FEngine* instance) {
-    Platform::DriverConfig driverConfig {
+Platform::DriverConfig getDriverConfig(FEngine* instance) {
+    Platform::DriverConfig const driverConfig {
+        .featureFlagManager = instance,
         .handleArenaSize = instance->getRequestedDriverHandleArenaSize(),
         .metalUploadBufferSizeBytes = instance->getConfig().metalUploadBufferSizeBytes,
         .disableParallelShaderCompile = instance->features.backend.disable_parallel_shader_compile,
@@ -110,11 +121,14 @@ backend::Platform::DriverConfig getDriverConfig(FEngine* instance) {
         .disableHeapHandleTags = instance->features.backend.disable_heap_handle_tags,
         .forceGLES2Context = instance->getConfig().forceGLES2Context,
         .stereoscopicType = instance->getConfig().stereoscopicType,
+        .stereoscopicEyeCount = instance->getConfig().stereoscopicEyeCount,
         .assertNativeWindowIsValid =
                 instance->features.backend.opengl.assert_native_window_is_valid,
         .metalDisablePanicOnDrawableFailure =
                 instance->getConfig().metalDisablePanicOnDrawableFailure,
         .gpuContextPriority = instance->getConfig().gpuContextPriority,
+        .vulkanEnableAsyncPipelineCachePrewarming =
+                instance->features.backend.vulkan.enable_pipeline_cache_prewarming,
         .vulkanEnableStagingBufferBypass =
                 instance->features.backend.vulkan.enable_staging_buffer_bypass,
         .asynchronousMode = instance->features.backend.enable_asynchronous_operation ?
@@ -257,6 +271,7 @@ FEngine::FEngine(Builder const& builder) :
         mRenderableManager(*this),
         mLightManager(*this),
         mCameraManager(*this),
+        mMaterialCache(builder->mConfig.materialCacheCapacity, builder->mConfig.programCacheCapacity),
         mCommandBufferQueue(
                 builder->mConfig.minCommandBufferSizeMB * MiB,
                 builder->mConfig.commandBufferSizeMB * MiB,
@@ -271,24 +286,25 @@ FEngine::FEngine(Builder const& builder) :
         mMainThreadId(ThreadUtils::getThreadId()),
         mConfig(builder->mConfig)
 {
+    // update all the features flags specified in the builder
+    for (auto const& [feature, value] : builder->mFeatureFlags) {
+        auto* const p = getFeatureFlagPtr(feature.c_str_safe(), true);
+        if (p) {
+            *p = value;
+        }
+    }
+
+
     // update a feature flag from Engine::Config if the flag is not specified in the Builder
     auto const featureFlagsBackwardCompatibility =
             [this, &builder](std::string_view const name, bool const value) {
-        if (builder->mFeatureFlags.find(name) == builder->mFeatureFlags.end()) {
+        if (builder->mFeatureFlags.find(utils::CString(name)) == builder->mFeatureFlags.end()) {
             auto* const p = getFeatureFlagPtr(name, true);
             if (p) {
                 *p = value;
             }
         }
     };
-
-    // update all the features flags specified in the builder
-    for (auto const& feature : builder->mFeatureFlags) {
-        auto* const p = getFeatureFlagPtr(feature.first.c_str_safe(), true);
-        if (p) {
-            *p = feature.second;
-        }
-    }
 
     // update "old" feature flags that were specified in Engine::Config
     featureFlagsBackwardCompatibility("backend.disable_parallel_shader_compile",
@@ -333,10 +349,6 @@ void FEngine::init() {
     DriverApi& driverApi = getDriverApi();
 
     mActiveFeatureLevel = std::min(mActiveFeatureLevel, driverApi.getFeatureLevel());
-
-#ifndef FILAMENT_ENABLE_FEATURE_LEVEL_0
-    assert_invariant(mActiveFeatureLevel > FeatureLevel::FEATURE_LEVEL_0);
-#endif
 
     LOG(INFO) << "Backend feature level: " << int(driverApi.getFeatureLevel());
     LOG(INFO) << "FEngine feature level: " << int(mActiveFeatureLevel);
@@ -445,34 +457,23 @@ void FEngine::init() {
             driverApi,
             descriptor_sets::getPerRenderableLayout() };
 
-#ifdef FILAMENT_ENABLE_FEATURE_LEVEL_0
-    if (UTILS_UNLIKELY(mActiveFeatureLevel == FeatureLevel::FEATURE_LEVEL_0)) {
-        FMaterial::DefaultMaterialBuilder defaultMaterialBuilder;
-        defaultMaterialBuilder.package(
-                MATERIALS_DEFAULTMATERIAL_FL0_DATA, MATERIALS_DEFAULTMATERIAL_FL0_SIZE);
-        mDefaultMaterial = downcast(defaultMaterialBuilder.build(*const_cast<FEngine*>(this)));
-    } else
-#endif
-    {
-        FMaterial::DefaultMaterialBuilder defaultMaterialBuilder;
-        switch (mConfig.stereoscopicType) {
-            case StereoscopicType::NONE:
-            case StereoscopicType::INSTANCED:
-                defaultMaterialBuilder.package(
-                        MATERIALS_DEFAULTMATERIAL_DATA, MATERIALS_DEFAULTMATERIAL_SIZE);
-                break;
-            case StereoscopicType::MULTIVIEW:
+    FMaterial::DefaultMaterialBuilder defaultMaterialBuilder;
+    switch (mConfig.stereoscopicType) {
+        case StereoscopicType::NONE:
+        case StereoscopicType::INSTANCED:
+            defaultMaterialBuilder.package(
+                    MATERIALS_DEFAULTMATERIAL_DATA, MATERIALS_DEFAULTMATERIAL_SIZE);
+            break;
+        case StereoscopicType::MULTIVIEW:
 #ifdef FILAMENT_ENABLE_MULTIVIEW
-                defaultMaterialBuilder.package(
-                        MATERIALS_DEFAULTMATERIAL_MULTIVIEW_DATA,
-                        MATERIALS_DEFAULTMATERIAL_MULTIVIEW_SIZE);
+            defaultMaterialBuilder.package(
+                    MATERIALS_DEFAULTMATERIAL_MULTIVIEW_DATA, MATERIALS_DEFAULTMATERIAL_MULTIVIEW_SIZE);
 #else
-                assert_invariant(false);
+            assert_invariant(false);
 #endif
-                break;
-        }
-        mDefaultMaterial = downcast(defaultMaterialBuilder.build(*this));
+            break;
     }
+    mDefaultMaterial = downcast(defaultMaterialBuilder.build(*this));
 
     // We must commit the default material instance here. It may not be used in a scene, but its
     // descriptor set may still be used for shared variants.
@@ -531,14 +532,10 @@ void FEngine::init() {
             &debug.shadowmap.debug_directional_shadowmap, [this] {
                 mMaterials.forEach([this](FMaterial* material) {
                     if (material->getMaterialDomain() == MaterialDomain::SURFACE) {
-
-                        material->setConstant(
-                                +ReservedSpecializationConstants::CONFIG_DEBUG_DIRECTIONAL_SHADOWMAP,
-                                debug.shadowmap.debug_directional_shadowmap);
-
-                        material->invalidate(
-                                Variant::DIR | Variant::SRE | Variant::DEP,
-                                Variant::DIR | Variant::SRE);
+                        material->getPrograms().setConstants({
+                            { +ReservedSpecializationConstants::CONFIG_DEBUG_DIRECTIONAL_SHADOWMAP,
+                              debug.shadowmap.debug_directional_shadowmap },
+                        });
                     }
                 });
             });
@@ -547,14 +544,10 @@ void FEngine::init() {
             &debug.lighting.debug_froxel_visualization, [this] {
                 mMaterials.forEach([this](FMaterial* material) {
                     if (material->getMaterialDomain() == MaterialDomain::SURFACE) {
-
-                        material->setConstant(
-                                +ReservedSpecializationConstants::CONFIG_DEBUG_FROXEL_VISUALIZATION,
-                                debug.lighting.debug_froxel_visualization);
-
-                        material->invalidate(
-                                Variant::DYN | Variant::DEP,
-                                Variant::DYN);
+                        material->getPrograms().setConstants({
+                            { +ReservedSpecializationConstants::CONFIG_DEBUG_FROXEL_VISUALIZATION,
+                              debug.lighting.debug_froxel_visualization },
+                        });
                     }
                 });
             });
@@ -587,6 +580,9 @@ void FEngine::shutdown() {
     DLOG(INFO) << "CircularBuffer: High watermark " << wm / 1024 << " KiB (" << wmpct << "%)";
 #endif
 
+    /* Destroy any leftover items in the cache. */
+    mMaterialCache.terminate(*this);
+
     DriverApi& driver = getDriverApi();
 
     /*
@@ -597,7 +593,7 @@ void FEngine::shutdown() {
     mResourceAllocatorDisposer->terminate();
     mResourceAllocatorDisposer.reset();
     mDFG.terminate(*this);                  // free-up the DFG
-    mRenderableManager.terminate();         // free-up all renderables
+    mRenderableManager.terminate(driver);   // free-up all renderables
     mLightManager.terminate();              // free-up all lights
     mCameraManager.terminate(*this);        // free-up all cameras
 
@@ -698,6 +694,12 @@ void FEngine::shutdown() {
         // Driver::terminate() has been called here.
     }
 
+    // Handle any pending deferred destruction for asynchronous objects.
+    if (isAsynchronousModeEnabled()) {
+        gcDeferredAsyncObjectDestruction();
+        assert_invariant(mDeferredAsyncObjectDestruction.empty());
+    }
+
     // Finally, call user callbacks that might have been scheduled.
     // These callbacks CANNOT call driver APIs.
     getDriver().purge();
@@ -713,12 +715,11 @@ void FEngine::shutdown() {
     mJobSystem.emancipate();
 }
 
-void FEngine::prepare() {
+void FEngine::prepare(DriverApi& driver) {
     FILAMENT_TRACING_CALL(FILAMENT_TRACING_CATEGORY_FILAMENT);
     // prepare() is called once per Renderer frame. Ideally we would upload the content of
     // UBOs that are visible only. It's not such a big issue because the actual upload() is
     // skipped if the UBO hasn't changed. Still we could have a lot of these.
-    DriverApi& driver = getDriverApi();
     const bool useUboBatching = isUboBatchingEnabled();
 
     if (useUboBatching) {
@@ -727,19 +728,26 @@ void FEngine::prepare() {
     }
 
     UboManager* uboManager = mUboManager;
+    size_t const capacity = getMinCommandBufferSize();
     for (auto& materialInstanceList: mMaterialInstances) {
-        materialInstanceList.second.forEach([&driver, uboManager](FMaterialInstance* item) {
-            // post-process materials instances must be commited explicitly because their
-            // parameters are typically not set at this point in time.
-            if (item->getMaterial()->getMaterialDomain() == MaterialDomain::SURFACE) {
-                item->commit(driver, uboManager);
-            }
-        });
+        materialInstanceList.second.forEach(
+                [this, &driver, uboManager, capacity](FMaterialInstance const* item) {
+                    // post-process materials instances must be commited explicitly because their
+                    // parameters are typically not set at this point in time.
+                    if (item->getMaterial()->getMaterialDomain() == MaterialDomain::SURFACE) {
+                        // If the remaining space is less than half the capacity, we flush right
+                        // away to allow some headroom for commands that might come later.
+                        if (UTILS_UNLIKELY(driver.getCircularBuffer().getUsed() > capacity / 2)) {
+                            flush();
+                        }
+                        item->commit(driver, uboManager);
+                    }
+                });
     }
 
     if (useUboBatching) {
         assert_invariant(mUboManager != nullptr);
-        getUboManager()->finishBeginFrame(getDriverApi());
+        getUboManager()->finishBeginFrame(driver);
     }
 
     mMaterials.forEach([](FMaterial* material) {
@@ -750,12 +758,44 @@ void FEngine::prepare() {
 }
 
 void FEngine::gc() {
-    // Note: this runs in a Job
-    auto& em = mEntityManager;
-    mRenderableManager.gc(em);
-    mLightManager.gc(em);
-    mTransformManager.gc(em);
-    mCameraManager.gc(*this, em);
+    JobSystem& js = getJobSystem();
+    auto *rootJob = js.createJob();
+
+    js.run(
+            jobs::createJob(js, rootJob, [this] {
+                // These are safe to GC *sequentially* from a worker thread.
+                // The JobSystem acts as a release/acquire operation.
+                mLightManager.gc(mEntityManager);
+                mTransformManager.gc(mEntityManager);
+                mCameraManager.gc(*this, mEntityManager);
+            }));
+
+    if (isAsynchronousModeEnabled()) {
+        // gcDeferredAsyncObjectDestruction() is thread-safe in this context because
+        // 1. JobSystem provides the release/acquire operation
+        // 2. it's only used from the main thread, which we are blocking during the gc
+        js.run(jobs::createJob(js, rootJob, &FEngine::gcDeferredAsyncObjectDestruction, this));
+    }
+
+    // RenderableManager cannot be gc'ed from a different thread, because it needs the DriverAPI
+    mRenderableManager.gc(mEntityManager, getDriverApi());
+
+    js.runAndWait(rootJob);
+}
+
+void FEngine::gcDeferredAsyncObjectDestruction() {
+    if (mDeferredAsyncObjectDestruction.empty()) {
+        return;
+    }
+    auto it = std::remove_if(
+            mDeferredAsyncObjectDestruction.begin(),
+            mDeferredAsyncObjectDestruction.end(),
+            [](auto& f) {
+                return f(); // Returns true if it should be removed
+            }
+    );
+    // Actually erase the elements from the vector
+    mDeferredAsyncObjectDestruction.erase(it, mDeferredAsyncObjectDestruction.end());
 }
 
 void FEngine::submitFrame() {
@@ -768,6 +808,12 @@ void FEngine::submitFrame() {
 void FEngine::flush() {
     // flush the command buffer
     flushCommandBuffer(mCommandBufferQueue);
+
+    // In single-threaded mode, we have to call execute() to drain the command
+    // buffer to really free up space
+    if constexpr (!UTILS_HAS_THREADING) {
+        execute();
+    }
 }
 
 void FEngine::flushAndWait() {
@@ -831,8 +877,14 @@ int FEngine::loop() {
     #endif
     if (portString != nullptr) {
         const int port = atoi(portString);
+
+        ShaderLanguage preferredLanguage = ShaderLanguage::UNSPECIFIED;
+        if (mBackend == Backend::METAL) {
+            preferredLanguage = ShaderLanguage::MSL;
+        }
+
         debug.server = new matdbg::DebugServer(mBackend,
-                mDriver->getShaderLanguages(ShaderLanguage::UNSPECIFIED).front(),
+                mDriver->getShaderLanguages(preferredLanguage).front(),
                 matdbg::DbgShaderModel((uint8_t) mDriver->getShaderModel()), port);
 
         // Sometimes the server can fail to spin up (e.g. if the above port is already in use).
@@ -1134,11 +1186,18 @@ bool FEngine::isValid(const T* ptr, ResourceList<T> const& list) const {
     return l.find(ptr) != l.end();
 }
 
+template <typename T, typename = void>
+struct HasIsCreationComplete : std::false_type {};
+
+template <typename T>
+struct HasIsCreationComplete<T, std::void_t<decltype(std::declval<T>().isCreationComplete())>>
+        : std::true_type {};
+
 template<typename T>
 UTILS_ALWAYS_INLINE
-bool FEngine::terminateAndDestroy(const T* p, ResourceList<T>& list) {
-    if (p == nullptr) return true;
-    bool const success = list.remove(p);
+bool FEngine::terminateAndDestroy(const T* ptr, ResourceList<T>& list) {
+    if (ptr == nullptr) return true;
+    bool const success = list.remove(ptr);
 
 #if UTILS_HAS_RTTI
     auto typeName = CallStack::typeName<T>();
@@ -1148,9 +1207,42 @@ bool FEngine::terminateAndDestroy(const T* p, ResourceList<T>& list) {
 #endif
 
     if (ASSERT_PRECONDITION_NON_FATAL(success,
-            "Object %s at %p doesn't exist (double free?)", typeNameCStr, p)) {
-        const_cast<T*>(p)->terminate(*this);
-        mHeapAllocator.destroy(const_cast<T*>(p));
+            "Object %s at %p doesn't exist (double free?)", typeNameCStr, ptr)) {
+
+        T* p = const_cast<T*>(ptr);
+
+        if constexpr (HasIsCreationComplete<T>::value) {
+            // The presence of 'isCreationComplete' in type T implies it supports asynchronous
+            // creation. For these asynchronous objects, we can terminate the backend resources
+            // immediately as they are no longer referenced. However, we defer the destruction of
+            // the frontend object if it's still being loaded.
+            // Reason: The creation process is still active and holds a reference to the frontend
+            // object to set `mCreationComplete` to true (see FTexture::FTexture). Deleting it now
+            // may cause a crash, so we wait until creation completes.
+
+            // Terminate the backend resource immediately as they're unnecessary from this point.
+            p->terminate(*this);
+
+            if (p->isCreationComplete()) {
+                // If creation is complete, we free the frontend object immediately. Note that in
+                // regular (non-async) mode, the `isCreationComplete` method always return true.
+                mHeapAllocator.destroy(p);
+            } else {
+                // We defer the destruction of the frontend object until the creation process
+                // completes. This ensures the object remains valid while the creation process still
+                // holds references to it.
+                mDeferredAsyncObjectDestruction.push_back([this, p]() {
+                    if (!p->isCreationComplete()) {
+                        return false;
+                    }
+                    mHeapAllocator.destroy(p);
+                    return true;
+                });
+            }
+        } else {
+            p->terminate(*this);
+            mHeapAllocator.destroy(p);
+        }
     }
     return success;
 }
@@ -1323,7 +1415,7 @@ bool FEngine::destroy(const FMaterialInstance* p) {
 
 UTILS_NOINLINE
 void FEngine::destroy(Entity const e) {
-    mRenderableManager.destroy(e);
+    mRenderableManager.destroy(e, getDriverApi());
     mLightManager.destroy(e);
     mTransformManager.destroy(e);
     mCameraManager.destroy(*this, e);
@@ -1447,20 +1539,22 @@ size_t FEngine::getColorGradingCount() const noexcept { return mColorGradings.si
 size_t FEngine::getRenderTargetCount() const noexcept { return mRenderTargets.size(); }
 
 AsyncCallId FEngine::runCommandAsync(Invocable<void()>&& command,
-        CallbackHandler* handler, Invocable<void()>&& onComplete) {
+        CallbackHandler* handler, AsyncCompletionCallback onComplete, void* user) {
 
     struct RunCommandAsyncCallback {
-        Invocable<void()> f;
-        static void func(void* user) {
-            auto* const c = static_cast<RunCommandAsyncCallback*>(user);
-            c->f();
-            delete c;
+        AsyncCompletionCallback userCallback;
+        void* userParam;
+        static void func(void* wrappedData) {
+            auto const* const data = static_cast<RunCommandAsyncCallback*>(wrappedData);
+            data->userCallback(data->userParam);
+            delete data;
         }
     };
-    auto* const user = new(std::nothrow) RunCommandAsyncCallback{ std::move(onComplete) };
+    auto* const wrappedData = new(std::nothrow) RunCommandAsyncCallback{
+            std::move(onComplete), user };
 
     return getDriverApi().queueCommandAsync(std::move(command), handler, &RunCommandAsyncCallback::func,
-            user);
+            wrappedData);
 }
 
 bool FEngine::cancelAsyncCall(AsyncCallId const id) {
@@ -1527,9 +1621,9 @@ Engine::FeatureLevel FEngine::setActiveFeatureLevel(FeatureLevel featureLevel) {
     return (mActiveFeatureLevel = std::max(mActiveFeatureLevel, featureLevel));
 }
 
-bool FEngine::isAsynchronousOperationSupported() const noexcept {
-    return features.backend.enable_asynchronous_operation &&
-        mConfig.asynchronousMode != AsynchronousMode::NONE;
+bool FEngine::isAsynchronousModeEnabled() const noexcept {
+    DriverApi& driver = const_cast<FEngine*>(this)->getDriverApi();
+    return driver.isAsynchronousModeEnabled();
 }
 
 #if defined(__EMSCRIPTEN__)
@@ -1545,30 +1639,109 @@ void FEngine::unprotected() noexcept {
     mUnprotectedDummySwapchain->makeCurrent(getDriverApi());
 }
 
-bool FEngine::setFeatureFlag(char const* name, bool const value) const noexcept {
-    auto* const p = getFeatureFlagPtr(name);
-    if (p) {
-        *p = value;
-    }
-    return p != nullptr;
+Slice<const Engine::FeatureFlag> FEngine::getFeatureFlags() const noexcept {
+    // Engine::FeatureFlag and FeatureFlagManager::FeatureFlag are the same type
+    Slice const r{ FeatureFlagManager::getFeatureFlags() };
+    Slice const result{
+        reinterpret_cast<Engine::FeatureFlag const*>(r.data()),
+        r.size()
+    };
+    return result;
+}
+
+bool FEngine::setFeatureFlag(char const* name, bool const value) noexcept {
+    return FeatureFlagManager::setFeatureFlag(name, value);
 }
 
 std::optional<bool> FEngine::getFeatureFlag(char const* name) const noexcept {
-    auto* const p = getFeatureFlagPtr(name, true);
-    if (p) {
-        return *p;
-    }
-    return std::nullopt;
+    return FeatureFlagManager::getFeatureFlag(name);
 }
 
 bool* FEngine::getFeatureFlagPtr(std::string_view name, bool const allowConstant) const noexcept {
-    auto pos = std::find_if(mFeatures.begin(), mFeatures.end(),
-            [name](FeatureFlag const& entry) {
-                return name == entry.name;
-            });
+    return FeatureFlagManager::getFeatureFlagPtr(name, allowConstant);
+}
 
-    return (pos != mFeatures.end() && (!pos->constant || allowConstant)) ?
-           const_cast<bool*>(pos->value) : nullptr;
+FixedCapacityVector<Variant> FEngine::getMaterialCompileVariants(
+        FView const* view,
+        tribool const shadowReceiver,
+        tribool const skinning) noexcept {
+
+    // the maximum possible is 6 variants (4 color + 2 depth)
+    auto variants = FixedCapacityVector<Variant>::with_capacity(6);
+
+    // apply() iteratively expands the `variants` vector by mutating existing elements
+    // in-place if `value` is determinate, or by duplicating them if `value` is indeterminate.
+    //
+    // @param start   The index in `variants` to begin the operation.
+    // @param value   The tribool state (false, true, or indeterminate) of the feature.
+    // @param setter  A pointer to a member function of Variant that sets the feature bit.
+    auto apply = [&variants](size_t const start, tribool const value, auto setter) {
+        if (value.is_indeterminate()) {
+            size_t const count = variants.size();
+            for (size_t i = start; i < count; ++i) {
+                // To maintain permutations, we first grab a copy of the variant
+                Variant v = variants[i];
+                // Mutate the original in-place for the `false` state
+                (variants[i].*setter)(false);
+                // Set the `true` state on our copy and push it as a new permutation
+                (v.*setter)(true);
+                variants.push_back(v);
+            }
+        } else {
+            // The feature is statically known, so just mutate all existing elements in-place
+            bool const b = value.is_true();
+            for (size_t i = start; i < variants.size(); ++i) {
+                (variants[i].*setter)(b);
+            }
+        }
+    };
+
+    Variant baseVariant{};
+    baseVariant.setDirectionalLighting(view->hasDirectionalLighting());
+    baseVariant.setDynamicLighting(view->hasDynamicLighting());
+    baseVariant.setFog(view->hasFog());
+    baseVariant.setShadowSampler2D(view->hasShadowing() && (view->getShadowType() != ShadowType::PCF));
+    baseVariant.setStereo(view->hasStereo());
+
+    variants.push_back(baseVariant);
+    apply(0, skinning, &Variant::setSkinning);
+    apply(0, shadowReceiver, &Variant::setShadowReceiver);
+
+    Variant depthVariant{};
+    if (view->hasShadowing()) {
+        // needsShadowMap() is no good here, because it can change based on the visibility of the shadow maps
+        depthVariant = Variant{Variant::DEPTH_VARIANT};
+        depthVariant.setDepthMoments(view->getShadowType() == ShadowType::VSM);
+    }
+    if (view->hasPostProcessPass()) {
+        // This is needed if we're going to generate the structure pass. That is however very hard to tell
+        // because the logic exists only in the FrameGraph. For now, we assume that if postFx is enabled, we'll
+        // need the depth variant.
+        depthVariant = Variant{Variant::DEPTH_VARIANT};
+    }
+
+    if (Variant::isValidDepthVariant(depthVariant)) {
+        // if we have a valid depth variant, add the stereo and skinning bits
+        depthVariant.setStereo(view->hasStereo());
+        
+        size_t const depthStart = variants.size();
+        variants.push_back(depthVariant);
+        apply(depthStart, skinning, &Variant::setSkinning);
+    }
+
+    return variants;
+}
+
+void FEngine::compile(
+        CompilerPriorityQueue const priority,
+        FMaterial const* material,
+        FView const* view,
+        tribool const shadowReceiver,
+        tribool const skinning,
+        CallbackHandler* handler,
+        Invocable<void(Material*)>&& callback) {
+    auto const variants = getMaterialCompileVariants(view, shadowReceiver, skinning);
+    material->compile(priority, variants, handler, std::move(callback));
 }
 
 // ------------------------------------------------------------------------------------------------

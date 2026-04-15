@@ -10,6 +10,7 @@ cmake_minimum_required(VERSION 3.22.1)
 # ==================================================================================================
 # Toolchain configuration
 # ==================================================================================================
+# On iOS, the deployment target is set inside third_party/clang/ios.cmake
 if (APPLE AND NOT IOS)
     # This must be set before project() is called
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "")
@@ -46,8 +47,6 @@ option(FILAMENT_ENABLE_TSAN "Enable Thread Sanitizer" OFF)
 
 option(FILAMENT_ENABLE_COVERAGE "Enable LLVM code coverage" OFF)
 
-option(FILAMENT_ENABLE_FEATURE_LEVEL_0 "Enable Feature Level 0" ON)
-
 option(FILAMENT_ENABLE_MULTIVIEW "Enable multiview for Filament" OFF)
 
 option(FILAMENT_SUPPORTS_OSMESA "Enable OSMesa (headless GL context) for Filament" OFF)
@@ -63,6 +62,8 @@ option(FILAMENT_SUPPORTS_WEBP_TEXTURES "Enable webp texture support for Filament
 # This is to disable GTAO for the short-term while we investigate a way to better manage size increases.
 # On the regular filament build (where size is of less concern), we enable GTAO by default.
 option(FILAMENT_DISABLE_GTAO "Disable GTAO" OFF)
+
+option(FILAMENT_BUILD_TESTING "Build tests" ON)
 
 set(FILAMENT_NDK_VERSION "" CACHE STRING
     "Android NDK version or version prefix to be used when building for Android."
@@ -323,11 +324,13 @@ endif()
 if (FILAMENT_ENABLE_LTO)
     include(CheckIPOSupported)
 
-    check_ipo_supported(RESULT IPO_SUPPORT)
+    check_ipo_supported(RESULT IPO_SUPPORT OUTPUT IPO_ERROR)
 
     if (IPO_SUPPORT)
-        message(STATUS "LTO support is enabled")
+        message(STATUS "IPO / LTO is enabled")
         set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    else()
+        message(WARNING "IPO / LTO is not supported by this architecture: ${IPO_ERROR}")
     endif()
 endif()
 
@@ -367,14 +370,22 @@ endif()
 
 if (LINUX)
     option(USE_STATIC_LIBCXX "Link against the static runtime libraries." ON)
+
+    # Add this step to support both glibc-based Linux distributions (e.g., Ubuntu, Debian)
+    # and musl-based distributions (e.g., Alpine).
+    include(CheckSymbolExists)
+    check_symbol_exists(__GLIBC__ "features.h" CLANG_WITH_GLIBC)
+
     if (${USE_STATIC_LIBCXX})
         if (FILAMENT_USING_GCC)
             link_libraries("-static-libgcc -static-libstdc++")
-        else ()
+        elseif (CLANG_WITH_GLIBC)
             set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
             link_libraries("-static-libgcc -static-libstdc++")
             link_libraries(libc++.a)
             link_libraries(libc++abi.a)
+        else()
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static")
         endif()
     endif()
 
@@ -578,7 +589,7 @@ if (FILAMENT_SUPPORTS_METAL)
 endif()
 
 # Building filamat increases build times and isn't required for web, so turn it off by default.
-if (NOT WEBGL AND NOT IOS)
+if (NOT WEBGL)
     option(FILAMENT_BUILD_FILAMAT "Build filamat and JNI buildings" ON)
 else()
     option(FILAMENT_BUILD_FILAMAT "Build filamat and JNI buildings" OFF)
@@ -856,6 +867,12 @@ endfunction()
 # Sub-projects
 # ==================================================================================================
 
+include(CheckSymbolExists)
+check_symbol_exists(getopt_long "getopt.h" HAS_SYSTEM_GETOPT)
+if (NOT HAS_SYSTEM_GETOPT)
+    add_subdirectory(${EXTERNAL}/getopt)
+endif()
+
 # Common to all platforms
 add_subdirectory(${EXTERNAL}/libgtest/tnt)
 add_subdirectory(${LIBRARIES}/camutils)
@@ -868,6 +885,7 @@ add_subdirectory(${LIBRARIES}/gltfio)
 add_subdirectory(${LIBRARIES}/ibl)
 add_subdirectory(${LIBRARIES}/iblprefilter)
 add_subdirectory(${LIBRARIES}/image)
+add_subdirectory(${LIBRARIES}/imagediff)
 add_subdirectory(${LIBRARIES}/ktxreader)
 add_subdirectory(${LIBRARIES}/math)
 add_subdirectory(${LIBRARIES}/mathio)
@@ -890,10 +908,11 @@ add_subdirectory(${EXTERNAL}/cgltf/tnt)
 add_subdirectory(${EXTERNAL}/draco/tnt)
 add_subdirectory(${EXTERNAL}/jsmn/tnt)
 add_subdirectory(${EXTERNAL}/stb/tnt)
-add_subdirectory(${EXTERNAL}/getopt)
 add_subdirectory(${EXTERNAL}/perfetto/tnt)
 add_subdirectory(${EXTERNAL}/basisu/tnt)
 
+# imageio-lite is needed for viewer
+add_subdirectory(${LIBRARIES}/imageio-lite)
 
 # Note that this has to be placed after mikktspace in order for combine_static_libs to work.
 add_subdirectory(${LIBRARIES}/geometry)
@@ -939,7 +958,7 @@ set(FILAMENT_SAMPLES_BINARY_DIR ${PROJECT_BINARY_DIR}/samples)
 
 if (WEBGL)
     add_subdirectory(web/filament-js)
-    add_subdirectory(web/samples)
+    add_subdirectory(web/examples)
 endif()
 
 if (IS_HOST_PLATFORM)
@@ -962,6 +981,7 @@ if (IS_HOST_PLATFORM)
 
     add_subdirectory(${TOOLS}/cmgen)
     add_subdirectory(${TOOLS}/cso-lut)
+    add_subdirectory(${TOOLS}/diffimg)
     add_subdirectory(${TOOLS}/filamesh)
     add_subdirectory(${TOOLS}/glslminifier)
     add_subdirectory(${TOOLS}/matc)
@@ -976,6 +996,7 @@ if (IS_HOST_PLATFORM)
     add_subdirectory(${TOOLS}/roughness-prefilter)
     add_subdirectory(${TOOLS}/specular-color)
     add_subdirectory(${TOOLS}/uberz)
+    add_subdirectory(${TOOLS}/specgen)
 endif()
 
 # Generate exported executables for cross-compiled builds (Android, WebGL, and iOS)

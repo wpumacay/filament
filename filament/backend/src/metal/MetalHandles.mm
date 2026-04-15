@@ -269,6 +269,10 @@ MetalAttachment MetalSwapChain::acquireStencilTexture() {
 }
 
 id<MTLTexture> MetalSwapChain::ensureDepthStencilTexture(uint32_t width, uint32_t height) {
+    // Metal does not allow zero-sized textures, and will abort if we try to
+    // create one ([MTLTextureDescriptorInternal validateWithDevice:]).
+    width = std::max(width, 1u);
+    height = std::max(height, 1u);
     if (UTILS_LIKELY(depthStencilTexture && depthStencilTexture.width == width &&
                      depthStencilTexture.height == height)) {
         return depthStencilTexture;
@@ -1092,7 +1096,7 @@ MetalRenderTarget::MetalRenderTarget(MetalContext* context, uint32_t width, uint
         // a multisampled sidecar texture and do a resolve automatically.
         if (samples > 1 && texture->samples == 1) {
             auto& sidecar = texture->msaaSidecar;
-            if (!sidecar) {
+            if (!sidecar || sidecar.sampleCount != samples) {
                 sidecar = createMultisampledTexture(mtlTexture.pixelFormat, texture->width,
                         texture->height, samples);
             }
@@ -1123,7 +1127,7 @@ MetalRenderTarget::MetalRenderTarget(MetalContext* context, uint32_t width, uint
         // a multisampled sidecar texture and do a resolve automatically.
         if (samples > 1 && texture->samples == 1) {
             auto& sidecar = texture->msaaSidecar;
-            if (!sidecar) {
+            if (!sidecar || sidecar.sampleCount != samples) {
                 sidecar = createMultisampledTexture(mtlTexture.pixelFormat, texture->width,
                         texture->height, samples);
             }
@@ -1155,7 +1159,7 @@ MetalRenderTarget::MetalRenderTarget(MetalContext* context, uint32_t width, uint
         // a multisampled sidecar texture and do a resolve automatically.
         if (samples > 1 && texture->samples == 1) {
             auto& sidecar = texture->msaaSidecar;
-            if (!sidecar) {
+            if (!sidecar || sidecar.sampleCount != samples) {
                 sidecar = createMultisampledTexture(mtlTexture.pixelFormat, texture->width,
                         texture->height, samples);
             }
@@ -1441,7 +1445,7 @@ void MetalFence::cancel() {
 MetalDescriptorSetLayout::MetalDescriptorSetLayout(DescriptorSetLayout&& l) noexcept
     : mLayout(std::move(l)) {
     size_t dynamicBindings = 0;
-    for (const auto& binding : mLayout.bindings) {
+    for (const auto& binding : mLayout.descriptors) {
         if (any(binding.flags & DescriptorFlags::DYNAMIC_OFFSET)) {
             dynamicBindings++;
         }
@@ -1663,7 +1667,7 @@ id<MTLBuffer> MetalDescriptorSet::finalizeAndGetBuffer(MetalDriver* driver, Shad
             case DescriptorType::SAMPLER_EXTERNAL: {
                 auto found = textures.find(binding.binding);
                 if (found == textures.end()) {
-                    [encoder setTexture:driver->mContext->emptyTexture atIndex:binding.binding * 2];
+                    [encoder setTexture:getOrCreateEmptyTexture(driver->mContext) atIndex:binding.binding * 2];
                     id<MTLSamplerState> sampler =
                             driver->mContext->samplerStateCache.getOrCreateState({});
                     [encoder setSamplerState:sampler atIndex:binding.binding * 2 + 1];

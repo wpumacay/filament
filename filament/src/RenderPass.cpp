@@ -84,9 +84,9 @@ RenderPassBuilder& RenderPassBuilder::customCommand(
     return *this;
 }
 
-RenderPass RenderPassBuilder::build(FEngine const& engine) const {
+RenderPass RenderPassBuilder::build(FEngine const& engine, backend::DriverApi& driver) const {
     assert_invariant(mRenderableSoa);
-    return RenderPass{ engine, *this };
+    return RenderPass{ engine, driver, *this };
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -105,7 +105,7 @@ void RenderPass::DescriptorSetHandleDeleter::operator()(DescriptorSetHandle hand
 
 // ------------------------------------------------------------------------------------------------
 
-RenderPass::RenderPass(FEngine const& engine,
+RenderPass::RenderPass(FEngine const& engine, backend::DriverApi& driver,
         RenderPassBuilder const& builder) noexcept
         : mRenderableSoa(*builder.mRenderableSoa),
           mColorPassDescriptorSet(builder.mColorPassDescriptorSet) {
@@ -139,7 +139,7 @@ RenderPass::RenderPass(FEngine const& engine,
         }
     }
 
-    appendCommands(engine, { commandBegin, commandCount },
+    appendCommands(engine, driver, { commandBegin, commandCount },
             builder.mVisibleRenderables,
             builder.mCommandTypeFlags,
             builder.mFlags,
@@ -182,7 +182,7 @@ RenderPass::Command* RenderPass::resize(Arena& arena, Command* const last) noexc
     return last;
 }
 
-void RenderPass::appendCommands(FEngine const& engine,
+void RenderPass::appendCommands(FEngine const& engine, backend::DriverApi& driver,
         Slice<Command> commands,
         Range<uint32_t> const visibleRenderables,
         CommandTypeFlags const commandTypeFlags,
@@ -244,7 +244,7 @@ void RenderPass::appendCommands(FEngine const& engine,
     for (Command const* first = curr, *last = curr + commandCount ; first != last ; ++first) {
         if (UTILS_LIKELY((first->key & CUSTOM_MASK) == uint64_t(CustomCommand::PASS))) {
             auto ma = first->info.mi->getMaterial();
-            ma->prepareProgram(first->info.materialVariant, CompilerPriorityQueue::CRITICAL);
+            ma->prepareProgram(driver, first->info.materialVariant, CompilerPriorityQueue::CRITICAL);
         }
     }
 }
@@ -479,7 +479,7 @@ void RenderPass::generateCommands(CommandTypeFlags commandTypeFlags, Command* co
     const size_t offsetBegin = FScene::getPrimitiveCount(soa, range.first) * commandsPerPrimitive;
     const size_t offsetEnd   = FScene::getPrimitiveCount(soa, range.last) * commandsPerPrimitive;
     Command* curr = commands + offsetBegin;
-    Command* const last = commands + offsetEnd;
+    Command const* const last = commands + offsetEnd;
 
     /*
      * The switch {} below is to coerce the compiler into generating different versions of
@@ -555,6 +555,7 @@ RenderPass::Command* RenderPass::generateCommandsImpl(CommandTypeFlags extraFlag
 
     auto const* const UTILS_RESTRICT soaWorldAABBCenter = soa.data<FScene::WORLD_AABB_CENTER>();
     auto const* const UTILS_RESTRICT soaVisibility      = soa.data<FScene::VISIBILITY_STATE>();
+    auto const* const UTILS_RESTRICT soaSkinningData    = soa.data<FScene::SKINNING_STATE>();
     auto const* const UTILS_RESTRICT soaPrimitives      = soa.data<FScene::PRIMITIVES>();
     auto const* const UTILS_RESTRICT soaSkinning        = soa.data<FScene::SKINNING_BUFFER>();
     auto const* const UTILS_RESTRICT soaMorphing        = soa.data<FScene::MORPHING_BUFFER>();
@@ -567,7 +568,7 @@ RenderPass::Command* RenderPass::generateCommandsImpl(CommandTypeFlags extraFlag
     if constexpr (isDepthPass) {
         cmd.info.materialVariant = variant;
         cmd.info.rasterState = {};
-        cmd.info.rasterState.colorWrite = Variant::isPickingVariant(variant) || Variant::isVSMVariant(variant);
+        cmd.info.rasterState.colorWrite = Variant::isPickingVariant(variant) || Variant::isDepthMomentsVariant(variant);
         cmd.info.rasterState.depthWrite = true;
         cmd.info.rasterState.depthFunc = RasterState::DepthFunc::GE;
         cmd.info.rasterState.alphaToCoverage = false;
@@ -610,12 +611,12 @@ RenderPass::Command* RenderPass::generateCommandsImpl(CommandTypeFlags extraFlag
 
         // calculate the per-primitive face winding order inversion
         bool const inverseFrontFaces = viewInverseFrontFaces ^ soaVisibility[i].reversedWindingOrder;
-        bool const hasMorphing = soaVisibility[i].morphing;
-        bool const hasSkinning = soaVisibility[i].skinning;
+        bool const hasMorphing = soaSkinningData[i].morphType != RenderableManager::Builder::MorphType::NONE;
+        bool const hasSkinning = soaSkinningData[i].skinning;
         bool const hasSkinningOrMorphing = hasSkinning || hasMorphing;
 
         // if we are already an SSR variant, the SRE bit is already set
-        static_assert(Variant::SPECIAL_SSR & Variant::SRE);
+        static_assert(Variant::SPECIAL_SSR_VARIANT & Variant::SRE);
         Variant renderableVariant{ variant };
 
         // we can't have SSR and shadowing together by construction
@@ -797,16 +798,19 @@ RenderPass::Command* RenderPass::generateCommandsImpl(CommandTypeFlags extraFlag
                 cmd.info.rasterState.culling = cullingMode;
 
                 // FIXME: should writeDepthForShadowCasters take precedence over mi->getDepthWrite()?
-                cmd.info.rasterState.depthWrite = (1 // only keep bit 0
-                        & (mi->isDepthWriteEnabled() | (mode == TransparencyMode::TWO_PASSES_ONE_SIDE)
-                                                     | isPickingVariant)
-                                                   & !(filterTranslucentObjects & translucent)
-                                                   & !(depthFilterAlphaMaskedObjects & rs.alphaToCoverage))
-                                                  | writeDepthForShadowCasters;
+                cmd.info.rasterState.depthWrite =
+                        (1 // only keep bit 0
+                                & (mi->isDepthWriteEnabled() |
+                                          (mode == TransparencyMode::TWO_PASSES_ONE_SIDE) |
+                                          isPickingVariant) &
+                                !(depthFilterAlphaMaskedObjects & rs.alphaToCoverage)) |
+                        writeDepthForShadowCasters;
 
                 *curr = cmd;
                 // cancel command if both front and back faces are culled
                 curr->key |= select(cullingMode == CullingMode::FRONT_AND_BACK);
+                // cancel command if asked to filter translucent objects
+                curr->key |= select(filterTranslucentObjects & translucent);
             }
 
             ++curr;
@@ -900,6 +904,12 @@ void RenderPass::Executor::execute(FEngine const& engine, DriverApi& driver,
     size_t const capacity = engine.getMinCommandBufferSize();
     CircularBuffer const& circularBuffer = driver.getCircularBuffer();
 
+    // b/479079631: Log the number of commands in this render pass.
+    size_t const commandCount = last - first;
+    if (Platform* platform = engine.getPlatform(); platform->hasDebugUpdateStatFunc()) {
+        platform->debugUpdateStat("filament.renderer.render_pass.command_count", commandCount);
+    }
+
     if (first != last) {
         FILAMENT_TRACING_VALUE(FILAMENT_TRACING_CATEGORY_FILAMENT, "commandCount", last - first);
 
@@ -939,35 +949,36 @@ void RenderPass::Executor::execute(FEngine const& engine, DriverApi& driver,
 
         // Maximum space occupied in the CircularBuffer by a single `Command`. This must be
         // reevaluated when the inner loop below adds DriverApi commands or when we change the
-        // CommandStream protocol. Currently, the maximum is 248 bytes.
+        // CommandStream protocol. Currently, the maximum is 272 bytes.
         // The batch size is calculated by adding the size of all commands that can possibly be
         // emitted per draw call:
         constexpr size_t maxCommandSizeInBytes =
                 sizeof(COMMAND_TYPE(scissor)) +
                 sizeof(COMMAND_TYPE(bindDescriptorSet)) +
-                sizeof(COMMAND_TYPE(bindDescriptorSet)) +
+                sizeof(COMMAND_TYPE(bindDescriptorSet)) + backend::CustomCommand::align(sizeof(NoopCommand) + 4) +
                 sizeof(COMMAND_TYPE(bindPipeline)) +
                 sizeof(COMMAND_TYPE(bindRenderPrimitive)) +
                 sizeof(COMMAND_TYPE(bindDescriptorSet)) + backend::CustomCommand::align(sizeof(NoopCommand) + 8) +
                 sizeof(COMMAND_TYPE(setPushConstant)) +
                 sizeof(COMMAND_TYPE(draw2));
 
+        // Add 20% margin for safety
+        constexpr size_t safeCommandSizeInBytes = maxCommandSizeInBytes + (maxCommandSizeInBytes / 5);
 
         // Number of Commands that can be issued and guaranteed to fit in the current
-        // CircularBuffer allocation. In practice, we'll have tons of headroom especially if
-        // skinning and morphing aren't used. With a 2 MiB buffer (the default) a batch is
-        // 6553 commands (i.e. draw calls).
-        size_t const batchCommandCount = capacity / maxCommandSizeInBytes;
+        // CircularBuffer allocation. With a 2 MiB buffer (the default) a batch is
+        // 6432 commands (i.e. draw calls).
+        size_t const batchCommandCount = capacity / safeCommandSizeInBytes;
         while(first != last) {
             Command const* const batchLast = std::min(first + batchCommandCount, last);
 
             // actual number of commands we need to write (can be smaller than batchCommandCount)
             size_t const commandCount = batchLast - first;
-            size_t const commandSizeInBytes = commandCount * maxCommandSizeInBytes;
+            size_t const commandSizeInBytes = commandCount * safeCommandSizeInBytes;
 
             // check we have enough capacity to write these commandCount commands, if not,
             // request a new CircularBuffer allocation of `capacity` bytes.
-            if (UTILS_UNLIKELY(circularBuffer.getUsed() > capacity - commandSizeInBytes)) {
+            if (UTILS_UNLIKELY(circularBuffer.getUsed() + commandSizeInBytes > capacity)) {
                 // FIXME: eventually we can't flush here because this will be a secondary
                 //        command buffer. We will need another solution for overflows.
                 const_cast<FEngine&>(engine).flush();

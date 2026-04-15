@@ -38,12 +38,18 @@
 #include <filament/Engine.h>
 
 #include <backend/DriverEnums.h>
+#include <backend/CallbackHandler.h>
 
 #include <utils/compiler.h>
+#include <utils/Invocable.h>
 #include <utils/Panic.h>
 #include <utils/Slice.h>
+#include <utils/tribool.h>
 
 #include <chrono>
+#include <memory>
+#include <optional>
+#include <utility>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -350,8 +356,9 @@ size_t Engine::getRenderTargetCount() const noexcept {
 }
 
 AsyncCallId Engine::runCommandAsync(Invocable<void()>&& command, CallbackHandler* handler,
-        Invocable<void()>&& onComplete) {
-    return downcast(this)->runCommandAsync(std::move(command), handler, std::move(onComplete));
+        AsyncCompletionCallback onComplete, void* user) {
+    return downcast(this)->runCommandAsync(std::move(command), handler, std::move(onComplete),
+            user);
 }
 
 bool Engine::cancelAsyncCall(AsyncCallId const id) {
@@ -362,7 +369,7 @@ void Engine::flushAndWait() {
     downcast(this)->flushAndWait();
 }
 
-bool Engine::flushAndWait(uint64_t timeout) {
+bool Engine::flushAndWait(uint64_t const timeout) {
     return downcast(this)->flushAndWait(timeout);
 }
 
@@ -463,8 +470,8 @@ bool Engine::isStereoSupported(StereoscopicType) const noexcept {
     return downcast(this)->isStereoSupported();
 }
 
-bool Engine::isAsynchronousOperationSupported() const noexcept {
-    return downcast(this)->isAsynchronousOperationSupported();
+bool Engine::isAsynchronousModeEnabled() const noexcept {
+    return downcast(this)->isAsynchronousModeEnabled();
 }
 
 size_t Engine::getMaxStereoscopicEyes() noexcept {
@@ -489,6 +496,14 @@ std::optional<bool> Engine::getFeatureFlag(char const* name) const noexcept {
 
 bool* Engine::getFeatureFlagPtr(char const* UTILS_NONNULL name) const noexcept {
     return downcast(this)->getFeatureFlagPtr(name);
+}
+
+void Engine::compile(CompilerPriorityQueue priority, Material const* material, View const* view,
+        tribool shadowReceiver, tribool skinning, CallbackHandler* handler,
+        Invocable<void(Material*)>&& callback) {
+    downcast(this)->compile(priority,
+            downcast(material), downcast(view), shadowReceiver, skinning,
+            handler, std::move(callback));
 }
 
 #if defined(__EMSCRIPTEN__)

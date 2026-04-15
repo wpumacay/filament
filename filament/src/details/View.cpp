@@ -33,6 +33,7 @@
 #include "details/Engine.h"
 #include "details/IndirectLight.h"
 #include "details/InstanceBuffer.h"
+#include "details/MorphTargetBuffer.h"
 #include "details/RenderTarget.h"
 #include "details/Renderer.h"
 #include "details/Scene.h"
@@ -75,6 +76,7 @@
 #include <cmath>
 #include <chrono>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <new>
 #include <ratio>
@@ -103,6 +105,10 @@ FView::FView(FEngine& engine)
           mSharedState(std::make_shared<SharedState>())
 {
     DriverApi& driver = engine.getDriverApi();
+
+    mIsHighPrecisionEvsmSupported = driver.isTextureFormatFilterable(TextureFormat::RGBA32F);
+
+    mFeatureLevel = engine.getSupportedFeatureLevel();
 
     auto const& layout = engine.getPerRenderableDescriptorSetLayout();
 
@@ -142,7 +148,7 @@ FView::FView(FEngine& engine)
 #ifndef NDEBUG
     // This can fail if another view has already registered this data source
     mDebugState->owner = debugRegistry.registerDataSource("d.view.frame_info",
-            [weak = std::weak_ptr(mDebugState)]() -> DebugRegistry::DataSource {
+            [weak = std::weak_ptr<DebugState>(mDebugState)]() -> DebugRegistry::DataSource {
                 // the View could have been destroyed by the time we do this
                 auto const state = weak.lock();
                 if (!state) {
@@ -320,9 +326,9 @@ float2 FView::updateScale(FEngine& engine,
         // relative scaling ("velocity" control)
         const float scale = mScale.x * mScale.y * command;
 
-        const float w = float(mViewport.width);
-        const float h = float(mViewport.height);
         if (scale < 1.0f && !options.homogeneousScaling) {
+            const float w = float(mViewport.width);
+            const float h = float(mViewport.height);
             // figure out the major and minor axis
             const float major = std::max(w, h);
             const float minor = std::min(w, h);
@@ -351,7 +357,7 @@ float2 FView::updateScale(FEngine& engine,
         const auto s = mScale;
         mScale = clamp(s, options.minScale, options.maxScale);
 
-        // disable the integration term when we're outside the controllable range
+        // Disable the integration term when we're outside the controllable range
         // (i.e. we clamped). This help not to have to wait too long for the Integral term
         // to kick in after a clamping event.
         mPidController.setIntegralInhibitionEnabled(mScale != s);
@@ -394,8 +400,10 @@ bool FView::isSkyboxVisible() const noexcept {
     return skybox != nullptr && (skybox->getLayerMask() & mVisibleLayers);
 }
 
-void FView::prepareShadowing(FEngine& engine, FScene::RenderableSoa& renderableData,
-        FScene::LightSoa const& lightData, CameraInfo const& cameraInfo) noexcept {
+void FView::prepareShadowing(FEngine& engine, DriverApi& driver,
+        FScene::RenderableSoa& renderableData,
+        FScene::LightSoa const& lightData,
+        CameraInfo const& cameraInfo) noexcept {
     FILAMENT_TRACING_CALL(FILAMENT_TRACING_CATEGORY_FILAMENT);
 
     mHasShadowing = false;
@@ -404,7 +412,7 @@ void FView::prepareShadowing(FEngine& engine, FScene::RenderableSoa& renderableD
         return;
     }
 
-    auto& lcm = engine.getLightManager();
+    auto const& lcm = engine.getLightManager();
 
     ShadowMapManager::Builder builder;
 
@@ -461,8 +469,8 @@ void FView::prepareShadowing(FEngine& engine, FScene::RenderableSoa& renderableD
 
     if (builder.hasShadowMaps()) {
         ShadowMapManager::createIfNeeded(engine, mShadowMapManager);
-        auto const shadowTechnique = mShadowMapManager->update(builder, engine, *this,
-                cameraInfo, renderableData, lightData);
+        auto const shadowTechnique = mShadowMapManager->update(driver, builder, engine,
+                *this, cameraInfo, renderableData, lightData);
 
         mHasShadowing = any(shadowTechnique);
         mNeedsShadowMap = any(shadowTechnique & ShadowMapManager::ShadowTechnique::SHADOW_MAP);
@@ -685,7 +693,7 @@ void FView::prepare(FEngine& engine, DriverApi& driver, RootArenaScope& rootAren
 
         setFroxelizerSync(froxelizeLightsJob);
 
-        prepareShadowing(engine, renderableData, lightData, cameraInfo);
+        prepareShadowing(engine, driver, renderableData, lightData, cameraInfo);
 
         /*
          * Partition the SoA so that renderables are partitioned w.r.t their visibility into the
@@ -830,13 +838,18 @@ void FView::prepare(FEngine& engine, DriverApi& driver, RootArenaScope& rootAren
                             +PerRenderableBindingPoints::MORPHING_UNIFORMS,
                             morphing.handle, 0, sizeof(PerRenderableMorphingUib));
 
-                    descriptorSet.setSampler(layout,
-                            +PerRenderableBindingPoints::MORPH_TARGET_POSITIONS,
-                            morphing.morphTargetBuffer->getPositionsHandle(), {});
+                    const auto* mtb = morphing.morphTargetBuffer;
+                    if (mtb->hasPositions()) {
+                        descriptorSet.setSampler(layout,
+                                +PerRenderableBindingPoints::MORPH_TARGET_POSITIONS,
+                                mtb->getPositionsHandle(), {});
+                    }
 
-                    descriptorSet.setSampler(layout,
-                            +PerRenderableBindingPoints::MORPH_TARGET_TANGENTS,
-                            morphing.morphTargetBuffer->getTangentsHandle(), {});
+                    if (mtb->hasTangents()) {
+                        descriptorSet.setSampler(layout,
+                                +PerRenderableBindingPoints::MORPH_TARGET_TANGENTS,
+                                mtb->getTangentsHandle(), {});
+                    }
                 }
 
                 descriptorSet.commit(layout, driver);
@@ -1123,14 +1136,13 @@ void FView::prepareShadowMapping() const noexcept {
         uniforms = mShadowMapManager->getShadowMappingUniforms();
     }
 
-    constexpr float low  = 5.54f; // ~ std::log(std::numeric_limits<math::half>::max()) * 0.5f;
-    constexpr float high = 42.0f; // ~ std::log(std::numeric_limits<float>::max()) * 0.5f;
     constexpr uint32_t SHADOW_SAMPLING_RUNTIME_PCF = 0u;
     constexpr uint32_t SHADOW_SAMPLING_RUNTIME_EVSM = 1u;
     constexpr uint32_t SHADOW_SAMPLING_RUNTIME_DPCF = 2u;
     constexpr uint32_t SHADOW_SAMPLING_RUNTIME_PCSS = 3u;
     auto& s = mUniforms.edit();
     s.cascadeSplits = uniforms.cascadeSplits;
+    s.shadowAtlasResolution = uniforms.atlasResolution;
     s.ssContactShadowDistance = uniforms.ssContactShadowDistance;
     s.directionalShadows = int32_t(uniforms.directionalShadows);
     s.cascades = int32_t(uniforms.cascades);
@@ -1140,8 +1152,8 @@ void FView::prepareShadowMapping() const noexcept {
             break;
         case ShadowType::VSM:
             s.shadowSamplingType = SHADOW_SAMPLING_RUNTIME_EVSM;
-            s.vsmExponent = mVsmShadowOptions.highPrecision ? high : low;
-            s.vsmDepthScale = mVsmShadowOptions.minVarianceScale * 0.01f * s.vsmExponent;
+            s.vsmExponent = 0; // this is only used when rendering the shadowmap, not when using it
+            s.vsmMaxMoment = ShadowMapManager::getMaxMomentEVSM(mVsmShadowOptions);
             s.vsmLightBleedReduction = mVsmShadowOptions.lightBleedReduction;
             break;
         case ShadowType::DPCF:
@@ -1430,9 +1442,12 @@ void FView::setTemporalAntiAliasingOptions(TemporalAntiAliasingOptions options) 
 }
 
 void FView::setMultiSampleAntiAliasingOptions(MultiSampleAntiAliasingOptions options) noexcept {
-    options.sampleCount = uint8_t(options.sampleCount < 1u ? 1u : options.sampleCount);
-    mMultiSampleAntiAliasingOptions = options;
-    assert_invariant(!options.enabled || !mRenderTarget || !mRenderTarget->hasSampleableDepth());
+    // MSAA is a post-process effect, and post-processing is disabled at FL0
+    if (mFeatureLevel >= backend::FeatureLevel::FEATURE_LEVEL_1) {
+        options.sampleCount = uint8_t(options.sampleCount < 1u ? 1u : options.sampleCount);
+        mMultiSampleAntiAliasingOptions = options;
+        assert_invariant(!options.enabled || !mRenderTarget || !mRenderTarget->hasSampleableDepth());
+    }
 }
 
 void FView::setScreenSpaceReflectionsOptions(ScreenSpaceReflectionsOptions options) noexcept {
@@ -1470,6 +1485,9 @@ void FView::setAmbientOcclusionOptions(AmbientOcclusionOptions options) noexcept
 }
 void FView::setVsmShadowOptions(VsmShadowOptions options) noexcept {
     options.msaaSamples = std::max(uint8_t(0), options.msaaSamples);
+    if (!mIsHighPrecisionEvsmSupported) {
+        options.highPrecision = false;
+    }
     mVsmShadowOptions = options;
 }
 

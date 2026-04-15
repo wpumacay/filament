@@ -132,12 +132,14 @@ private:
     // Flush the current command buffer and reset the pipeline state.
     void endCommandRecording();
 
+    void acquireNextSwapchainImage();
+
     VulkanPlatform* mPlatform = nullptr;
     fvkmemory::ResourceManager mResourceManager;
 
     resource_ptr<VulkanSwapChain> mCurrentSwapChain;
     resource_ptr<VulkanRenderTarget> mDefaultRenderTarget;
-    VulkanRenderPass mCurrentRenderPass = {};
+    VulkanRenderPassContext mCurrentRenderPass = {};
     VmaAllocator mAllocator = VK_NULL_HANDLE;
     VkDebugReportCallbackEXT mDebugCallback = VK_NULL_HANDLE;
 
@@ -159,7 +161,6 @@ private:
     VulkanQueryManager mQueryManager;
     VulkanExternalImageManager mExternalImageManager;
     VulkanStreamedImageManager mStreamedImageManager;
-
 
     // This maps a VulkanSwapchain to a native swapchain. VulkanSwapchain should have a copy of the
     // Platform::Swapchain pointer, but queryFrameTimestamps() and queryCompositorTiming() are
@@ -204,7 +205,9 @@ private:
 
     bool const mIsSRGBSwapChainSupported;
     bool const mIsMSAASwapChainSupported;
+    bool const mAcquireSwapChainInMakeCurrent;
     backend::StereoscopicType const mStereoscopicType;
+    uint8_t const mStereoscopicEyeCount;
     backend::AsynchronousMode const mAsynchronousMode;
 
     // setAcquiredImage is a DECL_DRIVER_API_SYNCHRONOUS_N which means we don't necessarily have the

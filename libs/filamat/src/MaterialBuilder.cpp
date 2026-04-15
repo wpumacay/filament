@@ -131,7 +131,7 @@ void MaterialBuilderBase::prepare(bool const vulkanSemantics,
     // OpenGL is a special case. If we're doing any optimization, then we need to go to Spir-V.
     TargetLanguage glTargetLanguage = mOptimization > Optimization::PREPROCESSOR ?
                                       TargetLanguage::SPIRV : TargetLanguage::GLSL;
-    if (vulkanSemantics) {
+    if (vulkanSemantics || featureLevel == backend::FeatureLevel::FEATURE_LEVEL_0) {
         // Currently GLSLPostProcessor.cpp is incapable of compiling SPIRV to GLSL without
         // running the optimizer. For now we just activate the optimizer in that case.
         mOptimization = Optimization::PERFORMANCE;
@@ -167,7 +167,7 @@ void MaterialBuilderBase::prepare(bool const vulkanSemantics,
                     && featureLevel == backend::FeatureLevel::FEATURE_LEVEL_0
                     && shaderModel == ShaderModel::MOBILE) {
                 mCodeGenPermutations.push_back({
-                    shaderModel,
+                    ShaderModel::MOBILE,
                     TargetApi::OPENGL,
                     glTargetLanguage,
                     backend::FeatureLevel::FEATURE_LEVEL_0
@@ -849,17 +849,16 @@ static void showErrorMessage(const char* materialName, filament::Variant const v
     const char* targetApiString = "unknown";
     switch (targetApi) {
         case TargetApi::OPENGL:
-            targetApiString = (featureLevel == MaterialBuilder::FeatureLevel::FEATURE_LEVEL_0)
-                              ? "GLES 2.0.\n" : "OpenGL.\n";
+            targetApiString = (featureLevel == MaterialBuilder::FeatureLevel::FEATURE_LEVEL_0) ? "GLES 2.0" : "OpenGL";
             break;
         case TargetApi::VULKAN:
-            targetApiString = "Vulkan.\n";
+            targetApiString = "Vulkan";
             break;
         case TargetApi::METAL:
-            targetApiString = "Metal.\n";
+            targetApiString = "Metal";
             break;
         case TargetApi::WEBGPU:
-            targetApiString = "WebGPU.\n";
+            targetApiString = "WebGPU";
             break;
         case TargetApi::ALL:
             assert_invariant(false); // Unreachable.
@@ -869,24 +868,20 @@ static void showErrorMessage(const char* materialName, filament::Variant const v
     const char* shaderStageString = "unknown";
     switch (shaderType) {
         case ShaderStage::VERTEX:
-            shaderStageString = "Vertex Shader\n";
+            shaderStageString = "Vertex Shader";
             break;
         case ShaderStage::FRAGMENT:
-            shaderStageString = "Fragment Shader\n";
+            shaderStageString = "Fragment Shader";
             break;
         case ShaderStage::COMPUTE:
-            shaderStageString = "Compute Shader\n";
+            shaderStageString = "Compute Shader";
             break;
     }
 
     LOG(ERROR)
             << "Error in \"" << materialName << "\""
-            << ", Variant 0x" << io::hex << +variant.key
-            << ", " << targetApiString
-            << "=========================\n"
-            << "Generated " << shaderStageString
-            << "=========================\n"
-            << shaderCode;
+            << ", " << shaderStageString
+            << ", Variant " << io::hex << +variant.key;
 }
 
 bool MaterialBuilder::generateShaders(JobSystem& jobSystem, const std::vector<Variant>& variants,
@@ -943,6 +938,15 @@ bool MaterialBuilder::generateShaders(JobSystem& jobSystem, const std::vector<Va
         JobSystem::Job* parent = jobSystem.createJob();
 
         for (const auto& v : variants) {
+            if (params.featureLevel == FeatureLevel::FEATURE_LEVEL_0) {
+                assert_invariant(params.shaderModel == ShaderModel::MOBILE);
+                assert_invariant(params.targetApi == TargetApi::OPENGL);
+                if (filament::Variant::isStereoVariant(v.variant)) {
+                    // the stereo variant can never be used at feature level 0
+                    continue;
+                }
+            }
+
             JobSystem::Job* job = jobs::createJob(jobSystem, parent, [&]() {
                 if (cancelJobs.load()) {
                     return;
@@ -980,15 +984,15 @@ bool MaterialBuilder::generateShaders(JobSystem& jobSystem, const std::vector<Va
                 if (v.stage == ShaderStage::VERTEX) {
                     shader = sg.createSurfaceVertexProgram(
                             shaderModel, targetApi, targetLanguage, featureLevel,
-                            info, v.variant, mInterpolation, mVertexDomain);
+                            info, v.variant, mInterpolation, mVertexDomain, mApiLevel);
                 } else if (v.stage == ShaderStage::FRAGMENT) {
                     shader = sg.createSurfaceFragmentProgram(
                             shaderModel, targetApi, targetLanguage, featureLevel,
-                            info, v.variant, mInterpolation, mVariantFilter);
+                            info, v.variant, mInterpolation, mVariantFilter, mApiLevel);
                 } else if (v.stage == ShaderStage::COMPUTE) {
                     shader = sg.createSurfaceComputeProgram(
                             shaderModel, targetApi, targetLanguage, featureLevel,
-                            info);
+                            info, mApiLevel);
                 }
 
                 // Write the variant to a file.
@@ -1140,21 +1144,23 @@ bool MaterialBuilder::generateShaders(JobSystem& jobSystem, const std::vector<Va
 
     // Generate the dictionaries.
     for (const auto& s : glslEntries) {
-        textDictionary.addText(s.shader);
+        textDictionary.addText(s.stage, s.shader);
     }
     for (const auto& s : essl1Entries) {
-        textDictionary.addText(s.shader);
+        textDictionary.addText(s.stage, s.shader);
     }
     for (auto& s : spirvEntries) {
         std::vector const spirv{ std::move(s.data) };
         s.dictionaryIndex = spirvDictionary.addBlob(spirv);
     }
     for (const auto& s : metalEntries) {
-        textDictionary.addText(s.shader);
+        textDictionary.addText(s.stage, s.shader);
     }
     for (const auto& s : wgslEntries) {
-        textDictionary.addText(s.shader);
+        textDictionary.addText(s.stage, s.shader);
     }
+
+    textDictionary.resolve();
 
     // Emit dictionary chunk (TextDictionaryReader and DictionaryTextChunk)
     const auto& dictionaryChunk = container.push<DictionaryTextChunk>(
@@ -1322,8 +1328,7 @@ error:
     CodeGenParams const semanticCodeGenParams = {
             .shaderModel = ShaderModel::MOBILE,
             .targetApi = TargetApi::OPENGL,
-            .targetLanguage = (info.featureLevel == FeatureLevel::FEATURE_LEVEL_0) ?
-                              TargetLanguage::GLSL : TargetLanguage::SPIRV,
+            .targetLanguage = TargetLanguage::SPIRV,
             .featureLevel = info.featureLevel,
     };
 
@@ -1417,7 +1422,7 @@ bool MaterialBuilder::checkMaterialLevelFeatures(MaterialInfo const& info) const
         auto const* stage = to_string(sib.getStageFlags());
         for (auto const& sampler: samplers) {
             LOG(ERROR) << "\"" << sampler.name.c_str() << "\" "
-                   << Enums::toString(sampler.type).c_str() << " " << stage << '\n';
+                   << Enums::toString(sampler.type) << " " << stage << '\n';
         }
     };
 
@@ -1532,15 +1537,15 @@ std::string MaterialBuilder::peek(backend::ShaderStage const stage,
         case ShaderStage::VERTEX:
             return sg.createSurfaceVertexProgram(
                     params.shaderModel, params.targetApi, params.targetLanguage,
-                    params.featureLevel, info, {}, mInterpolation, mVertexDomain);
+                    params.featureLevel, info, {}, mInterpolation, mVertexDomain, mApiLevel);
         case ShaderStage::FRAGMENT:
             return sg.createSurfaceFragmentProgram(
                     params.shaderModel, params.targetApi, params.targetLanguage,
-                    params.featureLevel, info, {}, mInterpolation, mVariantFilter);
+                    params.featureLevel, info, {}, mInterpolation, mVariantFilter, mApiLevel);
         case ShaderStage::COMPUTE:
             return sg.createSurfaceComputeProgram(
                     params.shaderModel, params.targetApi, params.targetLanguage,
-                    params.featureLevel, info);
+                    params.featureLevel, info, mApiLevel);
     }
     return {};
 }

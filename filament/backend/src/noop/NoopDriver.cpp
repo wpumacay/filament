@@ -194,6 +194,10 @@ bool NoopDriver::isTextureFormatMipmappable(TextureFormat format) {
     return true;
 }
 
+bool NoopDriver::isTextureFormatFilterable(TextureFormat format) {
+    return true;
+}
+
 bool NoopDriver::isRenderTargetFormatSupported(TextureFormat format) {
     return true;
 }
@@ -247,6 +251,10 @@ bool NoopDriver::isProtectedTexturesSupported() {
 }
 
 bool NoopDriver::isDepthClampSupported() {
+    return false;
+}
+
+bool NoopDriver::isAsynchronousModeEnabled() {
     return false;
 }
 
@@ -372,6 +380,11 @@ void NoopDriver::stopCapture(int) {
 void NoopDriver::readPixels(Handle<HwRenderTarget> src,
         uint32_t x, uint32_t y, uint32_t width, uint32_t height,
         PixelBufferDescriptor&& p) {
+    scheduleDestroy(std::move(p));
+}
+
+void NoopDriver::readTexture(Handle<HwTexture> src, uint8_t level, uint16_t layer, uint32_t x,
+        uint32_t y, uint32_t width, uint32_t height, PixelBufferDescriptor&& p) {
     scheduleDestroy(std::move(p));
 }
 

@@ -79,6 +79,7 @@ static void process_GOOGLE_cpp_style_line_directive(OpenGLContext const& context
 static void process_OVR_multiview2(OpenGLContext const& context, int32_t eyeCount, char* source,
         size_t len) noexcept;
 static std::string_view process_ARB_shading_language_packing(OpenGLContext& context) noexcept;
+static std::string_view process_countBits(OpenGLContext& context) noexcept;
 static std::array<std::string_view, 3> splitShaderSource(std::string_view source);
 
 // ------------------------------------------------------------------------------------------------
@@ -114,6 +115,13 @@ struct ShaderCompilerService::OpenGLProgramToken : ProgramToken {
     void wait() const noexcept {
         std::unique_lock l(lock);
         cond.wait(l, [this] { return signaled; });
+    }
+
+    // Used in THREAD_POOL mode. Returns true if the token is signaled, meaning it's ready to be
+    // used.
+    bool isReady() const noexcept {
+        std::unique_lock const l(lock);
+        return signaled;
     }
 
     // This is invoked upon token completion, which occurs after a successful `gl.program`
@@ -229,7 +237,7 @@ void ShaderCompilerService::init() noexcept {
         uint32_t poolSize = 1;
         JobSystem::Priority priority = JobSystem::Priority::DISPLAY;
 
-        auto const& renderer = mDriver.getContext().state.renderer;
+        auto const& renderer = mDriver.getContext().renderer;
         // Some drivers support parallel shader compilation well, so we use N
         // threads, we can use lower priority threads here because urgent compilations
         // will most likely happen on the main gl thread. Using too many thread can
@@ -359,14 +367,15 @@ void ShaderCompilerService::compileProgram(
                                     << " failed to link or compile";
 #endif
                         }
+                        // The program blob is cached prior to signaling to ensure data integrity.
+                        // Since the receiving thread may immediately modify gl.program (e.g., via
+                        // glUniformBlockBinding) upon receipt of the signal, caching must be
+                        // finalized first.
+                        tryCachingProgram(mBlobCache, mDriver.mPlatform, token);
                         // Now `token->gl.program` must be populated, so we signal the completion
                         // of the linking. We don't need to check the result of the program here
                         // because it'll be done in the engine thread.
                         token->signal();
-                        // We try caching the program blob after sending the signal. This allows us
-                        // to unblock the engine thread as soon as the token is ready while
-                        // performing an expensive caching operation still in the pool.
-                        tryCachingProgram(mBlobCache, mDriver.mPlatform, token);
                         // Updates the token's state. If the token is canceled while this function
                         // executes, this update notifies `tick` that GL resource loading is
                         // complete, allowing `tick` to proceed with resource destruction.
@@ -523,8 +532,15 @@ GLuint ShaderCompilerService::initialize(program_token_t& token) {
 }
 
 void ShaderCompilerService::ensureTokenIsReady(program_token_t const& token) {
-    if (token->gl.program) {
-        return;// It's ready.
+    if (mMode == Mode::THREAD_POOL) {
+        // Check if `token->gl.program` is populated
+        if (token->isReady()) {
+            return;
+        }
+    } else {
+        if (token->gl.program) {
+            return;
+        }
     }
 
     switch (mMode) {
@@ -779,6 +795,7 @@ void ShaderCompilerService::cancelPendingSynchronousProgram(program_token_t cons
 
             // add support for ARB_shading_language_packing if needed
             auto const packingFunctions = process_ARB_shading_language_packing(context);
+            auto const countBitsFunctions = process_countBits(context);
 
             // split shader source, so we can insert the specialization constants and the packing
             // functions
@@ -789,10 +806,10 @@ void ShaderCompilerService::cancelPendingSynchronousProgram(program_token_t cons
                 version = "#version 310 es\n";
             }
 
-            std::array<std::string_view, 5> sources = {
+            std::array<std::string_view, 6> sources = {
                 version, prolog,
                 { specializationConstantString.data(), specializationConstantString.size() },
-                packingFunctions,
+                packingFunctions, countBitsFunctions,
                 { body.data(), body.size() - 1 } // null-terminated
             };
 
@@ -803,8 +820,8 @@ void ShaderCompilerService::cancelPendingSynchronousProgram(program_token_t cons
                     [](std::string_view s) { return !s.empty(); });
             size_t const count = std::distance(sources.begin(), partitionPoint);
 
-            std::array<const char*, 5> shaderStrings;
-            std::array<GLint, 5> lengths;
+            std::array<const char*, 6> shaderStrings;
+            std::array<GLint, 6> lengths;
             for (size_t j = 0; j < count; j++) {
                 shaderStrings[j] = sources[j].data();
                 lengths[j] = GLint(sources[j].size());
@@ -933,6 +950,7 @@ void ShaderCompilerService::cancelPendingSynchronousProgram(program_token_t cons
         return false;
     }
     token->retrievedFromBlobCache = true;
+    token->signal(); // notify that `token->gl.program` is ready to use
     return true;
 }
 
@@ -1084,6 +1102,29 @@ UTILS_NOINLINE
         }
     }
 }
+
+/* static */ std::string_view process_countBits(OpenGLContext& context) noexcept {
+    using namespace std::literals;
+    // bitCount is available in GL 4.0 and GLES 3.1.
+    if (context.isAtLeastGL<4, 0>() || context.isAtLeastGLES<3, 1>()) {
+        return ""sv;
+    }
+
+    // GLES 2.0 does not support bitwise operations or unsigned integers.
+    if (context.isES2()) {
+        return ""sv;
+    }
+
+    return R"(
+// https://graphics.stanford.edu/%7Eseander/bithacks.html
+int bitCount(highp uint value) {
+    value = value - ((value >> 1u) & 0x55555555u);
+    value = (value & 0x33333333u) + ((value >> 2u) & 0x33333333u);
+    return int(((value + (value >> 4u) & 0xF0F0F0Fu) * 0x1010101u) >> 24u);
+}
+)"sv;
+}
+
 
 // Tragically, OpenGL 4.1 doesn't support unpackHalf2x16 (appeared in 4.2) and
 // macOS doesn't support GL_ARB_shading_language_packing
