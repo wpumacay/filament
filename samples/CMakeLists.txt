@@ -359,3 +359,10 @@ set_target_properties(assets PROPERTIES FOLDER Samples/Assets)
 add_custom_target(envs DEPENDS ${target_envmaps})
 add_dependencies(filament envs)
 set_target_properties(envs PROPERTIES FOLDER Samples/Assets)
+
+option(FILAMENT_BUILD_CUSTOM_SAMPLES "Enables building custom samples for this fork" ON)
+
+if(FILAMENT_BUILD_CUSTOM_SAMPLES)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/wilbert)
+endif()
+
